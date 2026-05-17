@@ -9,10 +9,13 @@ on:
 jobs:
   ci-cd-pipeline:
     runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4          # ✅ updated from v3
+        uses: actions/checkout@v4
+      # ... rest stays the same          # ✅ updated from v3
 
       - name: Set up Python 3.10
         uses: actions/setup-python@v5      # ✅ updated from v4
