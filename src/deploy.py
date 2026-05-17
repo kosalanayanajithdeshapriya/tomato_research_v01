@@ -1,12 +1,10 @@
-"""
-Deploy model.h5 to Hugging Face Hub.
-Requires: HF_TOKEN environment variable (set as GitHub Secret).
-"""
-import os, sys, shutil
+import os
+import sys
 
 HF_TOKEN = os.environ.get("HF_TOKEN")
-REPO_ID  = os.environ.get("HF_REPO_ID", "your-username/tomato-growth-stage")
+REPO_ID = os.environ.get("HF_REPO_ID", "your-username/tomato-growth-stage")
 MODEL_DIR = "outputs/models"
+
 
 def deploy():
     if not HF_TOKEN:
@@ -24,8 +22,9 @@ def deploy():
         )
         print(f"[SUCCESS] Model deployed to https://huggingface.co/{REPO_ID}")
     except ImportError:
-        print("[ERROR] huggingface_hub not installed. Run: pip install huggingface_hub")
+        print("[ERROR] huggingface_hub not installed.")
         sys.exit(1)
+
 
 if __name__ == "__main__":
     deploy()

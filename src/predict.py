@@ -1,10 +1,15 @@
-import sys, os
-sys.path.insert(0, os.path.dirname(__file__))
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras.preprocessing import image as keras_image
-from config import CNN_MODEL_PATH, UNET_MODEL_PATH, IMG_SIZE, CLASS_NAMES
+from config import CNN_MODEL_PATH
+from config import UNET_MODEL_PATH
+from config import IMG_SIZE
+from config import CLASS_NAMES
 from utils import compute_leaf_pixel_fraction
 
 
@@ -14,23 +19,19 @@ def load_image(img_path: str) -> np.ndarray:
 
 
 def predict_growth_stage(img_path: str) -> dict:
-    """Full inference pipeline: segmentation → leaf density → classification."""
-
-    # Step 1 — Leaf segmentation with U-Net
     unet = tf.keras.models.load_model(UNET_MODEL_PATH, compile=False)
     img_array = load_image(img_path)
     mask = unet.predict(np.expand_dims(img_array, axis=0))[0, :, :, 0]
     leaf_density = compute_leaf_pixel_fraction(mask)
 
-    # Step 2 — Growth stage classification with CNN
     cnn = tf.keras.models.load_model(CNN_MODEL_PATH)
     probs = cnn.predict(np.expand_dims(img_array, axis=0))[0]
     pred_class = CLASS_NAMES[np.argmax(probs)]
-    confidence  = float(np.max(probs))
+    confidence = float(np.max(probs))
 
     result = {
-        "predicted_stage":  pred_class,
-        "confidence":       round(confidence, 4),
+        "predicted_stage": pred_class,
+        "confidence": round(confidence, 4),
         "leaf_density_lpf": round(leaf_density, 4),
         "all_probabilities": {
             cls: round(float(prob), 4)

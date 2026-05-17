@@ -1,10 +1,16 @@
-import os, sys, json
-sys.path.insert(0, os.path.dirname(__file__))
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import numpy as np
 import tensorflow as tf
-from sklearn.metrics import classification_report, confusion_matrix
-from config import CNN_MODEL_PATH, METRICS_PATH, CLASS_NAMES, MIN_ACCURACY
+from sklearn.metrics import classification_report
+from sklearn.metrics import confusion_matrix
+from config import CNN_MODEL_PATH
+from config import METRICS_PATH
+from config import CLASS_NAMES
+from config import MIN_ACCURACY
 from data_loader import get_data_generators
 from utils import load_metrics
 
@@ -22,13 +28,10 @@ def evaluate():
     y_pred = np.argmax(y_pred_probs, axis=1)
     y_true = val_gen.classes[:len(y_pred)]
 
-    report = classification_report(y_true, y_pred, target_names=CLASS_NAMES, output_dict=True)
-    cm     = confusion_matrix(y_true, y_pred)
-
     print("\n[Classification Report]")
     print(classification_report(y_true, y_pred, target_names=CLASS_NAMES))
     print("[Confusion Matrix]")
-    print(cm)
+    print(confusion_matrix(y_true, y_pred))
 
     metrics = load_metrics(METRICS_PATH)
     val_acc = metrics.get("val_accuracy", 0)
@@ -36,7 +39,8 @@ def evaluate():
     if val_acc < MIN_ACCURACY:
         print(f"[FAIL] val_accuracy {val_acc} < {MIN_ACCURACY}")
         sys.exit(1)
-    print(f"[PASS] val_accuracy {val_acc} ≥ {MIN_ACCURACY} — model accepted.")
+
+    print(f"[PASS] val_accuracy {val_acc} >= {MIN_ACCURACY} - model accepted.")
 
 
 if __name__ == "__main__":

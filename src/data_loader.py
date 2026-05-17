@@ -1,11 +1,13 @@
-import os, numpy as np
-import tensorflow as tf
+import os
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
-from config import DATA_DIR, IMG_SIZE, BATCH_SIZE, VALIDATION_SPLIT, AUGMENT
+from config import DATA_DIR
+from config import IMG_SIZE
+from config import BATCH_SIZE
+from config import VALIDATION_SPLIT
+from config import AUGMENT
 
 
 def get_data_generators():
-    """Return train and validation generators for CNN classification."""
     if AUGMENT:
         train_datagen = ImageDataGenerator(
             rescale=1.0 / 255,
@@ -49,22 +51,3 @@ def get_data_generators():
         seed=42,
     )
     return train_gen, val_gen
-
-
-def get_segmentation_generators(mask_dir: str):
-    """Return image/mask pairs for U-Net segmentation training."""
-    image_datagen = ImageDataGenerator(rescale=1.0 / 255, validation_split=VALIDATION_SPLIT)
-    mask_datagen  = ImageDataGenerator(rescale=1.0 / 255, validation_split=VALIDATION_SPLIT)
-
-    img_train = image_datagen.flow_from_directory(
-        os.path.join(DATA_DIR, "images"),
-        target_size=IMG_SIZE, batch_size=BATCH_SIZE,
-        class_mode=None, subset="training", seed=42
-    )
-    mask_train = mask_datagen.flow_from_directory(
-        mask_dir,
-        target_size=IMG_SIZE, batch_size=BATCH_SIZE,
-        class_mode=None, color_mode="grayscale",
-        subset="training", seed=42
-    )
-    return zip(img_train, mask_train)

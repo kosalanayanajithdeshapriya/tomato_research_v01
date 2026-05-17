@@ -1,7 +1,14 @@
-from tensorflow.keras import layers, Model
-from tensorflow.keras.applications import ResNet50, DenseNet121, InceptionV3, VGG19
+from tensorflow.keras import layers
+from tensorflow.keras import Model
+from tensorflow.keras.applications import ResNet50
+from tensorflow.keras.applications import DenseNet121
+from tensorflow.keras.applications import InceptionV3
+from tensorflow.keras.applications import VGG19
 from tensorflow.keras.optimizers import Adam
-from config import IMG_SIZE, CHANNELS, NUM_CLASSES, LEARNING_RATE
+from config import IMG_SIZE
+from config import CHANNELS
+from config import NUM_CLASSES
+from config import LEARNING_RATE
 
 
 def build_classification_head(base_model, num_classes):
@@ -15,12 +22,14 @@ def build_classification_head(base_model, num_classes):
 
 def build_resnet50(input_shape=(IMG_SIZE[0], IMG_SIZE[1], CHANNELS)):
     base = ResNet50(weights="imagenet", include_top=False, input_shape=input_shape)
-    base.trainable = False   # freeze for transfer learning
+    base.trainable = False
     outputs = build_classification_head(base, NUM_CLASSES)
     model = Model(base.input, outputs, name="ResNet50_TomatoStage")
-    model.compile(optimizer=Adam(LEARNING_RATE),
-                  loss="categorical_crossentropy",
-                  metrics=["accuracy"])
+    model.compile(
+        optimizer=Adam(LEARNING_RATE),
+        loss="categorical_crossentropy",
+        metrics=["accuracy"]
+    )
     return model
 
 
@@ -29,9 +38,11 @@ def build_densenet121(input_shape=(IMG_SIZE[0], IMG_SIZE[1], CHANNELS)):
     base.trainable = False
     outputs = build_classification_head(base, NUM_CLASSES)
     model = Model(base.input, outputs, name="DenseNet121_TomatoStage")
-    model.compile(optimizer=Adam(LEARNING_RATE),
-                  loss="categorical_crossentropy",
-                  metrics=["accuracy"])
+    model.compile(
+        optimizer=Adam(LEARNING_RATE),
+        loss="categorical_crossentropy",
+        metrics=["accuracy"]
+    )
     return model
 
 
@@ -40,9 +51,11 @@ def build_inceptionv3(input_shape=(299, 299, CHANNELS)):
     base.trainable = False
     outputs = build_classification_head(base, NUM_CLASSES)
     model = Model(base.input, outputs, name="InceptionV3_TomatoStage")
-    model.compile(optimizer=Adam(LEARNING_RATE),
-                  loss="categorical_crossentropy",
-                  metrics=["accuracy"])
+    model.compile(
+        optimizer=Adam(LEARNING_RATE),
+        loss="categorical_crossentropy",
+        metrics=["accuracy"]
+    )
     return model
 
 
@@ -51,7 +64,9 @@ def build_vgg19(input_shape=(IMG_SIZE[0], IMG_SIZE[1], CHANNELS)):
     base.trainable = False
     outputs = build_classification_head(base, NUM_CLASSES)
     model = Model(base.input, outputs, name="VGG19_TomatoStage")
-    model.compile(optimizer=Adam(LEARNING_RATE),
-                  loss="categorical_crossentropy",
-                  metrics=["accuracy"])
+    model.compile(
+        optimizer=Adam(LEARNING_RATE),
+        loss="categorical_crossentropy",
+        metrics=["accuracy"]
+    )
     return model

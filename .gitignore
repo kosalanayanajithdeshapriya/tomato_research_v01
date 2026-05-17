@@ -1,19 +1,11 @@
-# Python
 __pycache__/
 *.py[cod]
-*.egg-info/
 .env
 venv/
 .venv/
-
-# Data and outputs (too large for Git)
 data/
 outputs/
-
-# IDE
 .vscode/
 .idea/
-
-# OS
 .DS_Store
 Thumbs.db
