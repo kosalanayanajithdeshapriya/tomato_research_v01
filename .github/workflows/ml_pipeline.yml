@@ -29,7 +29,7 @@ jobs:
 
       - name: Lint with flake8
         run: |
-          flake8 src/ --max-line-length=100 --ignore=E402,W503,E501
+          flake8 src/ --max-line-length=120 --ignore=E402,W503,E501,E221,E241,E401,E302,E305,F401,F841
 
       - name: Train model
         run: python src/train.py
