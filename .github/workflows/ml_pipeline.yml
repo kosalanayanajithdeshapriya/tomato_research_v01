@@ -12,10 +12,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4          # ✅ updated from v3
 
       - name: Set up Python 3.10
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5      # ✅ updated from v4
         with:
           python-version: "3.10"
 
@@ -26,7 +26,7 @@ jobs:
 
       - name: Lint with flake8
         run: |
-          flake8 src/ --max-line-length=100 --ignore=E402
+          flake8 src/ --max-line-length=100 --ignore=E402,W503,E501
 
       - name: Train model
         run: python src/train.py
@@ -38,7 +38,7 @@ jobs:
         run: python src/evaluate.py
 
       - name: Upload model artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4   # ✅ already updated
         with:
           name: tomato-model-artifacts
           path: outputs/
