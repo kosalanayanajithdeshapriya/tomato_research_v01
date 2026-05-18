@@ -15,7 +15,7 @@ Built with a full MLOps workflow including CI/CD via GitHub Actions.
 
 This project detects the growth stage of tomato plants using leaf density
 estimation and convolutional neural networks. It is part of an undergraduate
-research project at the University of Jayewardenepura, Faculty of Engineering,
+research project at the University of Jaffna, Faculty of Engineering,
 Department of Computer Engineering.
 
 **Growth Stages Classified:**
