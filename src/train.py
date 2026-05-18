@@ -34,7 +34,7 @@ VALIDATION_SPLIT = 0.10         # lowered from 0.15 — more data for training
 MIN_ACCURACY    = 0.55
 FINE_TUNE_LAYERS = 30           # unfreeze last N layers of ResNet50
 
-CLASS_NAMES     = ["Seedling", "developing", "Flowering", "Fruiting"]
+CLASS_NAMES = ["developing", "flowering", "fruiting", "seeding"]  # ✅ correct
 NUM_CLASSES     = len(CLASS_NAMES)
 
 os.makedirs(MODEL_DIR, exist_ok=True)
