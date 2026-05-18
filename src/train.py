@@ -64,14 +64,13 @@ val_transforms = transforms.Compose([
 # ── Dataset ───────────────────────────────────────────────────────────────────
 def load_data():
     full_dataset = datasets.ImageFolder(DATA_DIR, transform=train_transforms)
-    val_size     = max(1, int(len(full_dataset) * VAL_SPLIT))  # FIX: ensure at least 1 sample
+    val_size     = max(1, int(len(full_dataset) * VAL_SPLIT))
     train_size   = len(full_dataset) - val_size
     train_ds, val_ds = random_split(full_dataset, [train_size, val_size],
                                     generator=torch.Generator().manual_seed(42))
 
     val_ds.dataset = datasets.ImageFolder(DATA_DIR, transform=val_transforms)
 
-    # FIX: num_workers=0 for CI compatibility (GitHub Actions can fail with num_workers>0)
     num_workers = 2 if DEVICE.type == "cuda" else 0
 
     train_loader = DataLoader(train_ds, batch_size=min(BATCH_SIZE, train_size),
@@ -149,7 +148,7 @@ def train():
     model     = build_model()
     criterion = nn.CrossEntropyLoss()
 
-    best_val_acc = 0.0
+    best_val_acc = -1.0          # FIX: start at -1 so epoch 1 always saves
     best_epoch   = 0
     history      = {"train_acc": [], "val_acc": [], "train_loss": [], "val_loss": []}
     no_improve   = 0
@@ -158,7 +157,7 @@ def train():
     # ── Phase 1: Head only ────────────────────────────────────────────────
     print("\n[INFO] Phase 1 - Training classification head...")
     optimizer = torch.optim.Adam(model.fc.parameters(), lr=LR_PHASE1)
-    scheduler = ReduceLROnPlateau(optimizer, factor=0.5, patience=3)  # FIX: removed deprecated verbose=True
+    scheduler = ReduceLROnPlateau(optimizer, factor=0.5, patience=3)
 
     for epoch in range(1, EPOCHS_PHASE1 + 1):
         tr_loss, tr_acc = train_epoch(model, train_loader, optimizer, criterion)
@@ -174,7 +173,7 @@ def train():
               f"loss: {tr_loss:.4f} acc: {tr_acc:.4f} | "
               f"val_loss: {vl_loss:.4f} val_acc: {vl_acc:.4f}")
 
-        if vl_acc > best_val_acc:
+        if vl_acc >= best_val_acc:      # FIX: >= so 0.0 also triggers save
             best_val_acc = vl_acc
             best_epoch   = epoch
             torch.save(model.state_dict(), CNN_MODEL_PATH)
@@ -194,7 +193,7 @@ def train():
     optimizer = torch.optim.Adam(
         filter(lambda p: p.requires_grad, model.parameters()), lr=LR_PHASE2
     )
-    scheduler  = ReduceLROnPlateau(optimizer, factor=0.5, patience=3)  # FIX: removed deprecated verbose=True
+    scheduler  = ReduceLROnPlateau(optimizer, factor=0.5, patience=3)
     no_improve = 0
     patience   = 5
 
@@ -212,7 +211,7 @@ def train():
               f"loss: {tr_loss:.4f} acc: {tr_acc:.4f} | "
               f"val_loss: {vl_loss:.4f} val_acc: {vl_acc:.4f}")
 
-        if vl_acc > best_val_acc:
+        if vl_acc >= best_val_acc:      # FIX: >= so 0.0 also triggers save
             best_val_acc = vl_acc
             best_epoch   = epoch
             torch.save(model.state_dict(), CNN_MODEL_PATH)
@@ -223,8 +222,12 @@ def train():
                 print(f"[INFO] Early stopping at epoch {epoch}")
                 break
 
-    # FIX: weights_only=True to suppress security warning
-    model.load_state_dict(torch.load(CNN_MODEL_PATH, weights_only=True))
+    # FIX: guard load in case file still missing for any reason
+    if os.path.exists(CNN_MODEL_PATH):
+        model.load_state_dict(torch.load(CNN_MODEL_PATH, weights_only=True))
+    else:
+        print("[WARN] No saved model found, using last epoch weights")
+
     _, final_val_acc, final_preds, final_labels = validate(model, val_loader, criterion)
 
     return model, history, final_preds, final_labels, final_val_acc, classes
@@ -239,8 +242,6 @@ def main():
     recall    = recall_score(labels, preds, average="weighted", zero_division=0)
     f1        = f1_score(labels, preds, average="weighted", zero_division=0)
 
-    # FIX: labels=list(range(NUM_CLASSES)) ensures all 4 classes always reported
-    #      even when CI val set has fewer than 4 classes present
     print("\n" + classification_report(
         labels, preds,
         target_names=CLASS_NAMES,
