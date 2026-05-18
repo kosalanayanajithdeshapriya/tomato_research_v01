@@ -31,9 +31,7 @@ jobs:
           flake8 src/ --max-line-length=120 --select=E9,F63,F7,F82
 
       - name: Set CI training config
-        run: |
-          sed -i 's/EPOCHS = 30/EPOCHS = 3/' src/config.py
-          sed -i 's/MIN_ACCURACY = 0.70/MIN_ACCURACY = 0.10/' src/config.py
+        run: echo "CI=true" >> $GITHUB_ENV   # ← replaces broken sed commands
 
       - name: Create sample dataset for CI
         run: |
@@ -41,7 +39,7 @@ jobs:
           import os
           import numpy as np
           from PIL import Image
-          classes = ["Seedling", "Vegetative", "Flowering", "Fruiting"]
+          classes = ["developing", "flowering", "fruiting", "seeding"]  # ← fixed
           os.makedirs("data", exist_ok=True)
           for cls in classes:
               os.makedirs(f"data/{cls}", exist_ok=True)
