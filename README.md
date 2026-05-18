@@ -8,8 +8,7 @@ Built with a full MLOps workflow including CI/CD via GitHub Actions.
 ![Python](https://img.shields.io/badge/Python-3.10-blue)
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.5.1-orange)
 ![CI/CD](https://img.shields.io/badge/CI%2FCD-GitHub%20Actions-green)
-![License](https://img.shields.io/badge/License-MIT-yellow)
-
+![License](https://img.shields.io/badge/License-CC%20BY--NC--ND%204.0-red)
 ---
 
 ## 📌 Project Overview
