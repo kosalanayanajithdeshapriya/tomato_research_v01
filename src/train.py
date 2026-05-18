@@ -10,6 +10,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from sklearn.metrics import precision_score, recall_score, f1_score, classification_report
 import numpy as np
 
+
 # ── Config ────────────────────────────────────────────────────────────────────
 DATA_DIR       = "data/"
 OUTPUT_DIR     = "outputs/"
@@ -19,7 +20,7 @@ CNN_MODEL_PATH = os.path.join(MODEL_DIR, "cnn_classifier.pth")
 PLOTS_DIR      = os.path.join(OUTPUT_DIR, "plots")
 
 IMG_SIZE       = (224, 224)
-BATCH_SIZE     = 32          # can increase with GPU
+BATCH_SIZE     = 32
 EPOCHS_PHASE1  = 30
 EPOCHS_PHASE2  = 20
 LR_PHASE1      = 0.0005
@@ -37,6 +38,7 @@ if DEVICE.type == "cuda":
 os.makedirs(MODEL_DIR, exist_ok=True)
 os.makedirs(PLOTS_DIR, exist_ok=True)
 
+
 # ── Transforms ────────────────────────────────────────────────────────────────
 train_transforms = transforms.Compose([
     transforms.Resize(IMG_SIZE),
@@ -47,7 +49,7 @@ train_transforms = transforms.Compose([
     transforms.RandomResizedCrop(224, scale=(0.7, 1.0)),
     transforms.ToTensor(),
     transforms.Normalize([0.485, 0.456, 0.406],
-                         [0.229, 0.224, 0.225]),  # ImageNet stats
+                         [0.229, 0.224, 0.225]),
 ])
 
 val_transforms = transforms.Compose([
@@ -57,36 +59,40 @@ val_transforms = transforms.Compose([
                          [0.229, 0.224, 0.225]),
 ])
 
+
 # ── Dataset ───────────────────────────────────────────────────────────────────
 def load_data():
     full_dataset = datasets.ImageFolder(DATA_DIR, transform=train_transforms)
-    val_size  = int(len(full_dataset) * VAL_SPLIT)
-    train_size = len(full_dataset) - val_size
+    val_size     = max(1, int(len(full_dataset) * VAL_SPLIT))  # FIX: ensure at least 1 sample
+    train_size   = len(full_dataset) - val_size
     train_ds, val_ds = random_split(full_dataset, [train_size, val_size],
                                     generator=torch.Generator().manual_seed(42))
 
-    # Apply val transforms to val split
     val_ds.dataset = datasets.ImageFolder(DATA_DIR, transform=val_transforms)
 
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE,
-                              shuffle=True, num_workers=2, pin_memory=True)
-    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE,
-                              shuffle=False, num_workers=2, pin_memory=True)
+    # FIX: num_workers=0 for CI compatibility (GitHub Actions can fail with num_workers>0)
+    num_workers = 2 if DEVICE.type == "cuda" else 0
+
+    train_loader = DataLoader(train_ds, batch_size=min(BATCH_SIZE, train_size),
+                              shuffle=True, num_workers=num_workers,
+                              pin_memory=(DEVICE.type == "cuda"))
+    val_loader   = DataLoader(val_ds, batch_size=min(BATCH_SIZE, val_size),
+                              shuffle=False, num_workers=num_workers,
+                              pin_memory=(DEVICE.type == "cuda"))
 
     print(f"[INFO] Train: {train_size} | Val: {val_size}")
     print(f"[INFO] Classes: {full_dataset.classes}")
     return train_loader, val_loader, full_dataset.classes
+
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 def build_model():
     print("[INFO] Building ResNet50 model...")
     model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
 
-    # Freeze all layers
     for param in model.parameters():
         param.requires_grad = False
 
-    # Replace classification head
     model.fc = nn.Sequential(
         nn.Linear(model.fc.in_features, 512),
         nn.BatchNorm1d(512),
@@ -98,6 +104,7 @@ def build_model():
         nn.Linear(256, NUM_CLASSES)
     )
     return model.to(DEVICE)
+
 
 # ── Train One Epoch ───────────────────────────────────────────────────────────
 def train_epoch(model, loader, optimizer, criterion):
@@ -114,6 +121,7 @@ def train_epoch(model, loader, optimizer, criterion):
         correct += (outputs.argmax(1) == labels).sum().item()
         total += labels.size(0)
     return total_loss / len(loader), correct / total
+
 
 # ── Validate ──────────────────────────────────────────────────────────────────
 def validate(model, loader, criterion):
@@ -133,22 +141,23 @@ def validate(model, loader, criterion):
             all_labels.extend(labels.cpu().numpy())
     return total_loss / len(loader), correct / total, all_preds, all_labels
 
+
 # ── Main Training Loop ────────────────────────────────────────────────────────
 def train():
     train_loader, val_loader, classes = load_data()
-    model = build_model()
+    model     = build_model()
     criterion = nn.CrossEntropyLoss()
 
-    best_val_acc  = 0.0
-    best_epoch    = 0
-    history       = {"train_acc": [], "val_acc": [], "train_loss": [], "val_loss": []}
-    no_improve    = 0
-    patience      = 7
+    best_val_acc = 0.0
+    best_epoch   = 0
+    history      = {"train_acc": [], "val_acc": [], "train_loss": [], "val_loss": []}
+    no_improve   = 0
+    patience     = 7
 
     # ── Phase 1: Head only ────────────────────────────────────────────────
     print("\n[INFO] Phase 1 - Training classification head...")
     optimizer = torch.optim.Adam(model.fc.parameters(), lr=LR_PHASE1)
-    scheduler = ReduceLROnPlateau(optimizer, factor=0.5, patience=3, verbose=True)
+    scheduler = ReduceLROnPlateau(optimizer, factor=0.5, patience=3)  # FIX: removed deprecated verbose=True
 
     for epoch in range(1, EPOCHS_PHASE1 + 1):
         tr_loss, tr_acc = train_epoch(model, train_loader, optimizer, criterion)
@@ -184,7 +193,7 @@ def train():
     optimizer = torch.optim.Adam(
         filter(lambda p: p.requires_grad, model.parameters()), lr=LR_PHASE2
     )
-    scheduler = ReduceLROnPlateau(optimizer, factor=0.5, patience=3, verbose=True)
+    scheduler  = ReduceLROnPlateau(optimizer, factor=0.5, patience=3)  # FIX: removed deprecated verbose=True
     no_improve = 0
     patience   = 5
 
@@ -213,11 +222,12 @@ def train():
                 print(f"[INFO] Early stopping at epoch {epoch}")
                 break
 
-    # Load best weights for final evaluation
-    model.load_state_dict(torch.load(CNN_MODEL_PATH))
+    # FIX: weights_only=True to suppress security warning
+    model.load_state_dict(torch.load(CNN_MODEL_PATH, weights_only=True))
     _, final_val_acc, final_preds, final_labels = validate(model, val_loader, criterion)
 
     return model, history, final_preds, final_labels, final_val_acc, classes
+
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
@@ -228,9 +238,14 @@ def main():
     recall    = recall_score(labels, preds, average="weighted", zero_division=0)
     f1        = f1_score(labels, preds, average="weighted", zero_division=0)
 
-    print("\n" + classification_report(labels, preds,
-                                       target_names=classes,
-                                       zero_division=0))
+    # FIX: labels=list(range(NUM_CLASSES)) ensures all 4 classes always reported
+    #      even when CI val set has fewer than 4 classes present
+    print("\n" + classification_report(
+        labels, preds,
+        target_names=CLASS_NAMES,
+        labels=list(range(NUM_CLASSES)),
+        zero_division=0
+    ))
 
     metrics = {
         "train_accuracy": round(float(history["train_acc"][-1]), 4),
@@ -255,6 +270,7 @@ def main():
 
     if val_acc < MIN_ACCURACY:
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
