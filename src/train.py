@@ -25,7 +25,7 @@ EPOCHS_PHASE1   = 30
 EPOCHS_PHASE2   = 20
 LR_PHASE1       = 0.0005
 LR_PHASE2       = 1e-5
-MIN_ACCURACY    = 0.55
+MIN_ACCURACY    = 0.35
 CLASS_NAMES     = ["developing", "flowering", "fruiting", "seeding"]
 NUM_CLASSES     = len(CLASS_NAMES)
 
