@@ -5,11 +5,11 @@ import torch.nn as nn
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import precision_score, recall_score, f1_score, classification_report
 import numpy as np
-
 
 # ── Config ────────────────────────────────────────────────────────────────────
 DATA_DIR       = "data/"
@@ -19,18 +19,15 @@ METRICS_PATH   = os.path.join(OUTPUT_DIR, "metrics.json")
 CNN_MODEL_PATH = os.path.join(MODEL_DIR, "cnn_classifier.pth")
 PLOTS_DIR      = os.path.join(OUTPUT_DIR, "plots")
 
-IMG_SIZE       = (224, 224)
-BATCH_SIZE     = 32
-VAL_SPLIT      = 0.10
-LR_PHASE1      = 0.0005
-LR_PHASE2      = 1e-5
-CLASS_NAMES    = ["developing", "flowering", "fruiting", "seeding"]
-NUM_CLASSES    = len(CLASS_NAMES)
-
-IS_CI          = os.getenv("CI", "false").lower() == "true"
-MIN_ACCURACY   = 0.30 if IS_CI else 0.55
-EPOCHS_PHASE1  = 3  if IS_CI else 30   # FIX: reduce epochs in CI
-EPOCHS_PHASE2  = 2  if IS_CI else 20   # FIX: reduce epochs in CI
+IMG_SIZE        = (224, 224)
+BATCH_SIZE      = 32
+EPOCHS_PHASE1   = 30
+EPOCHS_PHASE2   = 20
+LR_PHASE1       = 0.0005
+LR_PHASE2       = 1e-5
+MIN_ACCURACY    = 0.55
+CLASS_NAMES     = ["developing", "flowering", "fruiting", "seeding"]
+NUM_CLASSES     = len(CLASS_NAMES)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"[INFO] Using device: {DEVICE}")
@@ -39,7 +36,6 @@ if DEVICE.type == "cuda":
 
 os.makedirs(MODEL_DIR, exist_ok=True)
 os.makedirs(PLOTS_DIR, exist_ok=True)
-
 
 # ── Transforms ────────────────────────────────────────────────────────────────
 train_transforms = transforms.Compose([
@@ -61,39 +57,81 @@ val_transforms = transforms.Compose([
                          [0.229, 0.224, 0.225]),
 ])
 
-
-# ── Dataset ───────────────────────────────────────────────────────────────────
+# ── Data Loader (Stratified 70 | 20 | 10) ────────────────────────────────────
 def load_data():
-    full_dataset = datasets.ImageFolder(DATA_DIR, transform=train_transforms)
-    val_size     = max(1, int(len(full_dataset) * VAL_SPLIT))
-    train_size   = len(full_dataset) - val_size
-    train_ds, val_ds = random_split(full_dataset, [train_size, val_size],
-                                    generator=torch.Generator().manual_seed(42))
+    print("[INFO] Loading data with stratified 70/20/10 split...")
 
-    val_ds.dataset = datasets.ImageFolder(DATA_DIR, transform=val_transforms)
+    full_train_ds = datasets.ImageFolder(DATA_DIR, transform=train_transforms)
+    full_val_ds   = datasets.ImageFolder(DATA_DIR, transform=val_transforms)
 
-    num_workers = 2 if DEVICE.type == "cuda" else 0
+    labels  = full_train_ds.targets        # class index for every image
+    indices = list(range(len(full_train_ds)))
 
-    train_loader = DataLoader(train_ds, batch_size=min(BATCH_SIZE, train_size),
-                              shuffle=True, num_workers=num_workers,
-                              pin_memory=(DEVICE.type == "cuda"))
-    val_loader   = DataLoader(val_ds, batch_size=min(BATCH_SIZE, val_size),
-                              shuffle=False, num_workers=num_workers,
-                              pin_memory=(DEVICE.type == "cuda"))
+    # Step 1: Split 10% test from 90% train+val (stratified)
+    train_val_idx, test_idx = train_test_split(
+        indices,
+        test_size=0.10,
+        stratify=labels,
+        random_state=42
+    )
 
-    print(f"[INFO] Train: {train_size} | Val: {val_size}")
-    print(f"[INFO] Classes: {full_dataset.classes}")
-    return train_loader, val_loader, full_dataset.classes
+    # Step 2: Split remaining 90% → 70% train / 20% val (stratified)
+    train_val_labels = [labels[i] for i in train_val_idx]
+    train_idx, val_idx = train_test_split(
+        train_val_idx,
+        test_size=0.222,           # 0.222 × 90% ≈ 20% of total
+        stratify=train_val_labels,
+        random_state=42
+    )
+
+    # Create subsets — train gets augmentation, val/test do not
+    train_ds = Subset(full_train_ds, train_idx)
+    val_ds   = Subset(full_val_ds,   val_idx)
+    test_ds  = Subset(full_val_ds,   test_idx)
+
+    # Print per-class distribution for verification
+    print(f"\n{'Split':<8} {'Total':>6}  ", end="")
+    for cls in full_train_ds.classes:
+        print(f"{cls:>12}", end="")
+    print()
+    print("-" * 60)
+    for split_name, split_idx in [("Train", train_idx),
+                                   ("Val",   val_idx),
+                                   ("Test",  test_idx)]:
+        split_labels = [labels[i] for i in split_idx]
+        print(f"{split_name:<8} {len(split_idx):>6}  ", end="")
+        for cls_idx in range(NUM_CLASSES):
+            count = split_labels.count(cls_idx)
+            print(f"{count:>12}", end="")
+        print()
+    print()
+
+    # Save split indices so evaluate.py can reuse exact same test set
+    split_info = {
+        "train_idx": train_idx,
+        "val_idx":   val_idx,
+        "test_idx":  test_idx
+    }
+    with open(os.path.join(OUTPUT_DIR, "split_indices.json"), "w") as f:
+        json.dump(split_info, f)
+    print("[INFO] Split indices saved → outputs/split_indices.json")
+
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE,
+                              shuffle=True,  num_workers=2, pin_memory=True)
+    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE,
+                              shuffle=False, num_workers=2, pin_memory=True)
+    test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE,
+                              shuffle=False, num_workers=2, pin_memory=True)
+
+    return train_loader, val_loader, test_loader, full_train_ds.classes
 
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 def build_model():
     print("[INFO] Building ResNet50 model...")
     model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
-
     for param in model.parameters():
         param.requires_grad = False
-
     model.fc = nn.Sequential(
         nn.Linear(model.fc.in_features, 512),
         nn.BatchNorm1d(512),
@@ -120,7 +158,7 @@ def train_epoch(model, loader, optimizer, criterion):
         optimizer.step()
         total_loss += loss.item()
         correct += (outputs.argmax(1) == labels).sum().item()
-        total += labels.size(0)
+        total   += labels.size(0)
     return total_loss / len(loader), correct / total
 
 
@@ -133,11 +171,11 @@ def validate(model, loader, criterion):
         for images, labels in loader:
             images, labels = images.to(DEVICE), labels.to(DEVICE)
             outputs = model(images)
-            loss = criterion(outputs, labels)
+            loss    = criterion(outputs, labels)
             total_loss += loss.item()
             preds = outputs.argmax(1)
             correct += (preds == labels).sum().item()
-            total += labels.size(0)
+            total   += labels.size(0)
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
     return total_loss / len(loader), correct / total, all_preds, all_labels
@@ -145,24 +183,23 @@ def validate(model, loader, criterion):
 
 # ── Main Training Loop ────────────────────────────────────────────────────────
 def train():
-    train_loader, val_loader, classes = load_data()
+    train_loader, val_loader, test_loader, classes = load_data()
     model     = build_model()
     criterion = nn.CrossEntropyLoss()
 
-    best_val_acc = -1.0
-    best_epoch   = 0
-    history      = {"train_acc": [], "val_acc": [], "train_loss": [], "val_loss": []}
-    no_improve   = 0
-    patience     = 7
+    best_val_acc = 0.0
+    history      = {"train_acc": [], "val_acc": [],
+                    "train_loss": [], "val_loss": []}
 
     # ── Phase 1: Head only ────────────────────────────────────────────────
-    print("\n[INFO] Phase 1 - Training classification head...")
+    print("[INFO] Phase 1 - Training classification head...")
     optimizer = torch.optim.Adam(model.fc.parameters(), lr=LR_PHASE1)
-    scheduler = ReduceLROnPlateau(optimizer, factor=0.5, patience=3)
+    scheduler = ReduceLROnPlateau(optimizer, factor=0.5, patience=3, verbose=True)
+    no_improve, patience = 0, 7
 
     for epoch in range(1, EPOCHS_PHASE1 + 1):
-        tr_loss, tr_acc = train_epoch(model, train_loader, optimizer, criterion)
-        vl_loss, vl_acc, _, _ = validate(model, val_loader, criterion)
+        tr_loss, tr_acc          = train_epoch(model, train_loader, optimizer, criterion)
+        vl_loss, vl_acc, _, _    = validate(model, val_loader, criterion)
         scheduler.step(vl_loss)
 
         history["train_acc"].append(tr_acc)
@@ -174,9 +211,8 @@ def train():
               f"loss: {tr_loss:.4f} acc: {tr_acc:.4f} | "
               f"val_loss: {vl_loss:.4f} val_acc: {vl_acc:.4f}")
 
-        if vl_acc >= best_val_acc:
+        if vl_acc > best_val_acc:
             best_val_acc = vl_acc
-            best_epoch   = epoch
             torch.save(model.state_dict(), CNN_MODEL_PATH)
             no_improve = 0
         else:
@@ -185,22 +221,21 @@ def train():
                 print(f"[INFO] Early stopping at epoch {epoch}")
                 break
 
-    # ── Phase 2: Fine-tune top ResNet layers ──────────────────────────────
+    # ── Phase 2: Fine-tune layer3 + layer4 ───────────────────────────────
     print("\n[INFO] Phase 2 - Fine-tuning top ResNet50 layers...")
     for name, param in model.named_parameters():
         if "layer4" in name or "layer3" in name or "fc" in name:
             param.requires_grad = True
 
-    optimizer = torch.optim.Adam(
+    optimizer  = torch.optim.Adam(
         filter(lambda p: p.requires_grad, model.parameters()), lr=LR_PHASE2
     )
-    scheduler  = ReduceLROnPlateau(optimizer, factor=0.5, patience=3)
-    no_improve = 0
-    patience   = 5
+    scheduler  = ReduceLROnPlateau(optimizer, factor=0.5, patience=3, verbose=True)
+    no_improve, patience = 0, 5
 
     for epoch in range(1, EPOCHS_PHASE2 + 1):
-        tr_loss, tr_acc = train_epoch(model, train_loader, optimizer, criterion)
-        vl_loss, vl_acc, preds, labels = validate(model, val_loader, criterion)
+        tr_loss, tr_acc                   = train_epoch(model, train_loader, optimizer, criterion)
+        vl_loss, vl_acc, preds, lbls      = validate(model, val_loader, criterion)
         scheduler.step(vl_loss)
 
         history["train_acc"].append(tr_acc)
@@ -212,9 +247,8 @@ def train():
               f"loss: {tr_loss:.4f} acc: {tr_acc:.4f} | "
               f"val_loss: {vl_loss:.4f} val_acc: {vl_acc:.4f}")
 
-        if vl_acc >= best_val_acc:
+        if vl_acc > best_val_acc:
             best_val_acc = vl_acc
-            best_epoch   = epoch
             torch.save(model.state_dict(), CNN_MODEL_PATH)
             no_improve = 0
         else:
@@ -223,31 +257,28 @@ def train():
                 print(f"[INFO] Early stopping at epoch {epoch}")
                 break
 
-    if os.path.exists(CNN_MODEL_PATH):
-        model.load_state_dict(torch.load(CNN_MODEL_PATH, weights_only=True))
-    else:
-        print("[WARN] No saved model found, using last epoch weights")
+    # Load best weights for final val evaluation
+    model.load_state_dict(torch.load(CNN_MODEL_PATH))
+    _, final_val_acc, final_preds, final_labels = validate(
+        model, val_loader, criterion
+    )
 
-    _, final_val_acc, final_preds, final_labels = validate(model, val_loader, criterion)
-
-    return model, history, final_preds, final_labels, final_val_acc, classes
+    return model, history, final_preds, final_labels, final_val_acc, \
+           test_loader, classes
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     import sys
-    model, history, preds, labels, val_acc, classes = train()
+    model, history, preds, labels, val_acc, test_loader, classes = train()
 
     precision = precision_score(labels, preds, average="weighted", zero_division=0)
-    recall    = recall_score(labels, preds, average="weighted", zero_division=0)
-    f1        = f1_score(labels, preds, average="weighted", zero_division=0)
+    recall    = recall_score(labels, preds,    average="weighted", zero_division=0)
+    f1        = f1_score(labels, preds,        average="weighted", zero_division=0)
 
-    print("\n" + classification_report(
-        labels, preds,
-        target_names=CLASS_NAMES,
-        labels=list(range(NUM_CLASSES)),
-        zero_division=0
-    ))
+    print("\n── Validation Classification Report ─────")
+    print(classification_report(labels, preds,
+                                 target_names=classes, zero_division=0))
 
     metrics = {
         "train_accuracy": round(float(history["train_acc"][-1]), 4),
@@ -269,9 +300,9 @@ def main():
     print(f"\n[{status}] val_accuracy {val_acc:.4f} "
           f"{'≥' if val_acc >= MIN_ACCURACY else '<'} threshold {MIN_ACCURACY}")
     print("[INFO] Training complete.")
+    print("[INFO] Run python src/evaluate.py for final TEST set results.")
 
-    # FIX: in CI skip accuracy failure — random data makes accuracy meaningless
-    if val_acc < MIN_ACCURACY and not IS_CI:
+    if val_acc < MIN_ACCURACY:
         sys.exit(1)
 
 
