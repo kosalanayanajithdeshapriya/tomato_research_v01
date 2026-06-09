@@ -1,74 +1,349 @@
+import os
+import sys
+
+# ── Fix src module resolution (works locally and in CI) ──────────────────────
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import json
 import torch
 import torch.nn as nn
-import torchvision.models as models
-from src.unet import UNet
+import torchvision.transforms as transforms
+import torchvision.datasets as datasets
+from torch.utils.data import DataLoader, Subset
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import precision_score, recall_score, f1_score, classification_report
+import numpy as np
+
+from src.model import TomatoFusionModel
 
 
-class TomatoFusionModel(nn.Module):
-    def __init__(self, num_classes=4, backbone="resnet50"):
-        super().__init__()
+# ── Config ────────────────────────────────────────────────────────────────────
+DATA_DIR       = "data/"
+OUTPUT_DIR     = "outputs/"
+MODEL_DIR      = os.path.join(OUTPUT_DIR, "models")
+METRICS_PATH   = os.path.join(OUTPUT_DIR, "metrics.json")
+CNN_MODEL_PATH = os.path.join(MODEL_DIR, "cnn_classifier.pth")
+PLOTS_DIR      = os.path.join(OUTPUT_DIR, "plots")
 
-        # ── Branch 1: U-Net ───────────────────────────────────────────────
-        self.unet = UNet(in_channels=3, out_channels=1)
+IMG_SIZE       = (224, 224)
+BATCH_SIZE     = 32
+LR_PHASE1      = 0.0005
+LR_PHASE2      = 1e-5
+CLASS_NAMES    = ["developing", "flowering", "fruiting", "seeding"]
+NUM_CLASSES    = len(CLASS_NAMES)
 
-        # ── Branch 2: CNN Backbone ────────────────────────────────────────
-        if backbone == "resnet50":
-            base = models.resnet50(
-                weights=models.ResNet50_Weights.IMAGENET1K_V1
-            )
-            # FIX: keep as resnet object — preserves layer3/layer4 names
-            self.cnn     = base
-            self.cnn.fc  = nn.Identity()   # remove final FC layer
-            cnn_dim      = 2048
+IS_CI          = os.getenv("CI", "false").lower() == "true"
+MIN_ACCURACY   = 0.30 if IS_CI else 0.55
+EPOCHS_PHASE1  = 3  if IS_CI else 30
+EPOCHS_PHASE2  = 2  if IS_CI else 20
 
-        elif backbone == "densenet121":
-            base         = models.densenet121(
-                weights=models.DenseNet121_Weights.IMAGENET1K_V1
-            )
-            self.cnn     = base
-            self.cnn.classifier = nn.Identity()
-            cnn_dim      = 1024
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"[INFO] Using device: {DEVICE}")
+if DEVICE.type == "cuda":
+    print(f"[INFO] GPU: {torch.cuda.get_device_name(0)}")
 
+os.makedirs(MODEL_DIR, exist_ok=True)
+os.makedirs(PLOTS_DIR, exist_ok=True)
+
+
+# ── Transforms ────────────────────────────────────────────────────────────────
+train_transforms = transforms.Compose([
+    transforms.Resize(IMG_SIZE),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomRotation(30),
+    transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3),
+    transforms.RandomAffine(degrees=0, shear=20),
+    transforms.RandomResizedCrop(224, scale=(0.7, 1.0)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406],
+                         [0.229, 0.224, 0.225]),
+])
+
+val_transforms = transforms.Compose([
+    transforms.Resize(IMG_SIZE),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406],
+                         [0.229, 0.224, 0.225]),
+])
+
+
+# ── Dataset ───────────────────────────────────────────────────────────────────
+def load_data():
+    print("[INFO] Loading data with stratified 70/20/10 split...")
+
+    full_train_ds = datasets.ImageFolder(DATA_DIR, transform=train_transforms)
+    full_val_ds   = datasets.ImageFolder(DATA_DIR, transform=val_transforms)
+
+    labels  = full_train_ds.targets
+    indices = list(range(len(full_train_ds)))
+    total   = len(indices)
+
+    min_class_count = min(labels.count(i) for i in range(NUM_CLASSES))
+    use_stratify    = (not IS_CI) and (min_class_count >= 3)
+
+    if not use_stratify:
+        print("[INFO] Stratification disabled (CI mode or insufficient class samples)")
+
+    train_val_idx, test_idx = train_test_split(
+        indices,
+        test_size=max(1, int(total * 0.10)),
+        stratify=labels if use_stratify else None,
+        random_state=42
+    )
+
+    train_val_labels = [labels[i] for i in train_val_idx]
+    train_idx, val_idx = train_test_split(
+        train_val_idx,
+        test_size=max(1, int(len(train_val_idx) * 0.222)),
+        stratify=train_val_labels if use_stratify else None,
+        random_state=42
+    )
+
+    train_ds = Subset(full_train_ds, train_idx)
+    val_ds   = Subset(full_val_ds,   val_idx)
+
+    print(f"\n{'Split':<8} {'Total':>6}  ", end="")
+    for cls in full_train_ds.classes:
+        print(f"{cls:>12}", end="")
+    print()
+    print("-" * 60)
+    for split_name, split_idx in [("Train", train_idx),
+                                   ("Val",   val_idx),
+                                   ("Test",  test_idx)]:
+        split_labels = [labels[i] for i in split_idx]
+        print(f"{split_name:<8} {len(split_idx):>6}  ", end="")
+        for cls_idx in range(NUM_CLASSES):
+            print(f"{split_labels.count(cls_idx):>12}", end="")
+        print()
+    print()
+
+    split_info = {"train_idx": train_idx, "val_idx": val_idx, "test_idx": test_idx}
+    with open(os.path.join(OUTPUT_DIR, "split_indices.json"), "w") as f:
+        json.dump(split_info, f)
+    print("[INFO] Split indices saved → outputs/split_indices.json")
+
+    num_workers = 2 if DEVICE.type == "cuda" else 0
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=min(BATCH_SIZE, len(train_idx)),
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=(DEVICE.type == "cuda")
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=min(BATCH_SIZE, len(val_idx)),
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=(DEVICE.type == "cuda")
+    )
+
+    print(f"[INFO] Train: {len(train_idx)} | Val: {len(val_idx)} | Test: {len(test_idx)}")
+    print(f"[INFO] Classes: {full_train_ds.classes}")
+    return train_loader, val_loader, full_train_ds.classes
+
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+def build_model():
+    """
+    TomatoFusionModel already has:
+      - self.cnn (ResNet50 with fc=Identity → outputs [B, 2048])
+      - self.unet (U-Net → outputs lpf [B, 1])
+      - self.fusion_head (Linear(2049, 256) → [B, 4])
+
+    We ONLY need to unfreeze fusion_head for Phase 1.
+    Do NOT replace cnn.fc — that breaks the forward() shape contract.
+    """
+    print("[INFO] Building TomatoFusionModel (ResNet50 + U-Net)...")
+    model = TomatoFusionModel(num_classes=NUM_CLASSES).to(DEVICE)
+
+    # CNN backbone is already frozen in model.__init__()
+    # Unfreeze only fusion_head for Phase 1
+    for param in model.fusion_head.parameters():
+        param.requires_grad = True
+
+    # Keep U-Net frozen in Phase 1 (no mask labels yet)
+    for param in model.unet.parameters():
+        param.requires_grad = False
+
+    total_params     = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"[INFO] Total params: {total_params:,} | Trainable: {trainable_params:,}")
+
+    return model
+
+
+# ── Train One Epoch ───────────────────────────────────────────────────────────
+def train_epoch(model, loader, optimizer, criterion):
+    model.train()
+    total_loss, correct, total = 0, 0, 0
+    for images, labels in loader:
+        images, labels = images.to(DEVICE), labels.to(DEVICE)
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss    = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+        correct    += (outputs.argmax(1) == labels).sum().item()
+        total      += labels.size(0)
+    return total_loss / len(loader), correct / total
+
+
+# ── Validate ──────────────────────────────────────────────────────────────────
+def validate(model, loader, criterion):
+    model.eval()
+    total_loss, correct, total = 0, 0, 0
+    all_preds, all_labels = [], []
+    with torch.no_grad():
+        for images, labels in loader:
+            images, labels = images.to(DEVICE), labels.to(DEVICE)
+            outputs = model(images)
+            loss    = criterion(outputs, labels)
+            total_loss += loss.item()
+            preds = outputs.argmax(1)
+            correct    += (preds == labels).sum().item()
+            total      += labels.size(0)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+    return total_loss / len(loader), correct / total, all_preds, all_labels
+
+
+# ── Main Training Loop ────────────────────────────────────────────────────────
+def train():
+    train_loader, val_loader, classes = load_data()
+    model     = build_model()
+    criterion = nn.CrossEntropyLoss()
+
+    best_val_acc = -1.0
+    history      = {"train_acc": [], "val_acc": [],
+                    "train_loss": [], "val_loss": []}
+    no_improve   = 0
+    patience     = 7
+
+    # ── Phase 1: Train fusion_head only ──────────────────────────────────
+    print("\n[INFO] Phase 1 - Training fusion head only...")
+    optimizer = torch.optim.Adam(
+        filter(lambda p: p.requires_grad, model.parameters()), lr=LR_PHASE1
+    )
+    scheduler = ReduceLROnPlateau(optimizer, factor=0.5, patience=3)
+
+    for epoch in range(1, EPOCHS_PHASE1 + 1):
+        tr_loss, tr_acc       = train_epoch(model, train_loader, optimizer, criterion)
+        vl_loss, vl_acc, _, _ = validate(model, val_loader, criterion)
+        scheduler.step(vl_loss)
+
+        history["train_acc"].append(tr_acc)
+        history["val_acc"].append(vl_acc)
+        history["train_loss"].append(tr_loss)
+        history["val_loss"].append(vl_loss)
+
+        print(f"Epoch {epoch}/{EPOCHS_PHASE1} - "
+              f"loss: {tr_loss:.4f} acc: {tr_acc:.4f} | "
+              f"val_loss: {vl_loss:.4f} val_acc: {vl_acc:.4f}")
+
+        if vl_acc >= best_val_acc:
+            best_val_acc = vl_acc
+            torch.save(model.state_dict(), CNN_MODEL_PATH)
+            no_improve = 0
         else:
-            raise ValueError(f"Unsupported backbone: {backbone}")
+            no_improve += 1
+            if no_improve >= patience:
+                print(f"[INFO] Early stopping at epoch {epoch}")
+                break
 
-        # Freeze ALL CNN params — Phase 1 trains only head + U-Net
-        for param in self.cnn.parameters():
-            param.requires_grad = False
+    # ── Phase 2: Fine-tune layer3 + layer4 + fusion_head ─────────────────
+    print("\n[INFO] Phase 2 - Fine-tuning layer3, layer4 + fusion head...")
+    model.unfreeze_backbone(layers=["layer3", "layer4"])
 
-        # ── Feature Fusion Layer ──────────────────────────────────────────
-        self.fusion_head = nn.Sequential(
-            nn.Linear(cnn_dim + 1, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(256, num_classes)
+    optimizer  = torch.optim.Adam(
+        filter(lambda p: p.requires_grad, model.parameters()), lr=LR_PHASE2
+    )
+    scheduler  = ReduceLROnPlateau(optimizer, factor=0.5, patience=3)
+    no_improve = 0
+    patience   = 5
+
+    for epoch in range(1, EPOCHS_PHASE2 + 1):
+        tr_loss, tr_acc                = train_epoch(model, train_loader, optimizer, criterion)
+        vl_loss, vl_acc, preds, labels = validate(model, val_loader, criterion)
+        scheduler.step(vl_loss)
+
+        history["train_acc"].append(tr_acc)
+        history["val_acc"].append(vl_acc)
+        history["train_loss"].append(tr_loss)
+        history["val_loss"].append(vl_loss)
+
+        print(f"Epoch {epoch}/{EPOCHS_PHASE2} - "
+              f"loss: {tr_loss:.4f} acc: {tr_acc:.4f} | "
+              f"val_loss: {vl_loss:.4f} val_acc: {vl_acc:.4f}")
+
+        if vl_acc >= best_val_acc:
+            best_val_acc = vl_acc
+            torch.save(model.state_dict(), CNN_MODEL_PATH)
+            no_improve = 0
+        else:
+            no_improve += 1
+            if no_improve >= patience:
+                print(f"[INFO] Early stopping at epoch {epoch}")
+                break
+
+    if os.path.exists(CNN_MODEL_PATH):
+        model.load_state_dict(
+            torch.load(CNN_MODEL_PATH, weights_only=True, map_location=DEVICE)
         )
+        print(f"[INFO] Best model loaded from {CNN_MODEL_PATH}")
+    else:
+        print("[WARN] No saved model found, using last epoch weights")
 
-    def forward(self, x):
-        # ── Branch 1: Leaf Area Density ───────────────────────────────────
-        mask = self.unet(x)                           # [B, 1, 224, 224]
-        lpf  = mask.mean(dim=[1, 2, 3]).unsqueeze(1)  # [B, 1]
+    _, final_val_acc, final_preds, final_labels = validate(
+        model, val_loader, criterion
+    )
+    return model, history, final_preds, final_labels, final_val_acc, classes
 
-        # ── Branch 2: Visual Features ─────────────────────────────────────
-        features = self.cnn(x)                        # [B, 2048]
-        if features.dim() == 4:
-            features = features.view(features.size(0), -1)
 
-        # ── Fusion ────────────────────────────────────────────────────────
-        fused = torch.cat([lpf, features], dim=1)     # [B, 2049]
-        return self.fusion_head(fused)                # [B, 4]
+# ── Main ──────────────────────────────────────────────────────────────────────
+def main():
+    model, history, preds, labels, val_acc, classes = train()
 
-    def unfreeze_backbone(self, layers=("layer3", "layer4")):
-        # FIX: now named_parameters() returns "layer3.x.x", "layer4.x.x"
-        for name, param in self.cnn.named_parameters():
-            if any(layer in name for layer in layers):
-                param.requires_grad = True
-        print(f"[INFO] Unfroze CNN layers: {list(layers)}")
+    precision = precision_score(labels, preds, average="weighted", zero_division=0)
+    recall    = recall_score(labels, preds,    average="weighted", zero_division=0)
+    f1        = f1_score(labels, preds,        average="weighted", zero_division=0)
 
-    def get_leaf_density(self, x):
-        self.eval()
-        with torch.no_grad():
-            mask = self.unet(x)
-            lpf  = mask.mean(dim=[1, 2, 3])
-        return round(lpf.item(), 4)
+    print("\n── Validation Classification Report ─────")
+    print(classification_report(
+        labels, preds,
+        target_names=CLASS_NAMES,
+        labels=list(range(NUM_CLASSES)),
+        zero_division=0
+    ))
+
+    metrics = {
+        "train_accuracy": round(float(history["train_acc"][-1]), 4),
+        "val_accuracy":   round(float(val_acc), 4),
+        "precision":      round(float(precision), 4),
+        "recall":         round(float(recall), 4),
+        "f1_score":       round(float(f1), 4),
+        "total_epochs":   len(history["train_acc"]),
+    }
+
+    with open(METRICS_PATH, "w") as f:
+        json.dump(metrics, f, indent=4)
+
+    print("\n── RESULTS ──────────────────────────────")
+    for k, v in metrics.items():
+        print(f"  {k}: {v}")
+
+    status = "PASS" if val_acc >= MIN_ACCURACY else "FAIL"
+    print(f"\n[{status}] val_accuracy {val_acc:.4f} "
+          f"{'≥' if val_acc >= MIN_ACCURACY else '<'} threshold {MIN_ACCURACY}")
+    print("[INFO] Training complete.")
+    print("[INFO] Run python src/evaluate.py for final TEST set results.")
+
+    if val_acc < MIN_ACCURACY and not IS_CI:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
