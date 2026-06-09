@@ -1,43 +1,14 @@
-import os
-import sys
-import json
-import pytest
-import numpy as np
 import torch
-import torch.nn as nn
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
-from src.train import (
-    build_model,
-    NUM_CLASSES,
-    DEVICE,
-    CNN_MODEL_PATH,
-    METRICS_PATH,
-    IMG_SIZE,
-    IS_CI,
-    MIN_ACCURACY,
-)
-
-# ── Constants ─────────────────────────────────────────────────────────────────
-UNET_MODEL_PATH = os.path.join("outputs", "models", "unet_segmentation.pth")
+import pytest
+from src.unet import UNet
+from src.model import TomatoFusionModel
 
 
-# ── U-Net Definition ──────────────────────────────────────────────────────────
-class UNetBlock(nn.Module):
-    def __init__(self, in_ch, out_ch):
-        super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, 3, padding=1),
-            nn.ReLU(inplace=True),
-        )
-
-    def forward(self, x):
-        return self.block(x)
+BATCH    = 2
+DUMMY    = torch.randn(BATCH, 3, 224, 224)
 
 
+<<<<<<< Updated upstream
 class SimpleUNet(nn.Module):
     def __init__(self, in_channels=3, out_channels=1):
         super().__init__()
@@ -47,29 +18,53 @@ class SimpleUNet(nn.Module):
         self.up         = nn.ConvTranspose2d(128, 64, 2, stride=2)
         self.dec        = UNetBlock(128, 64)
         self.final      = nn.Conv2d(64, out_channels, 1)
+=======
+class TestUNet:
+    def test_output_shape(self):
+        model  = UNet()
+        output = model(DUMMY)
+        assert output.shape == (BATCH, 1, 224, 224)
+>>>>>>> Stashed changes
 
-    def forward(self, x):
-        e = self.enc(x)
-        p = self.pool(e)
-        b = self.bottleneck(p)
-        u = self.up(b)
-        d = self.dec(torch.cat([u, e], dim=1))
-        return self.final(d)
+    def test_output_range(self):
+        model  = UNet()
+        output = model(DUMMY)
+        assert output.min() >= 0.0
+        assert output.max() <= 1.0
 
-
-# ── CNN Tests ─────────────────────────────────────────────────────────────────
-def test_cnn_model_file_exists():
-    assert os.path.exists(CNN_MODEL_PATH), \
-        f"Model not found at {CNN_MODEL_PATH}"
-
-
-def test_cnn_model_loads():
-    assert os.path.exists(CNN_MODEL_PATH), "Model file missing"
-    model = build_model()
-    model.load_state_dict(torch.load(CNN_MODEL_PATH, weights_only=True))
-    assert model is not None
+    def test_sigmoid_applied(self):
+        model  = UNet()
+        output = model(DUMMY)
+        assert output.min() >= 0.0 and output.max() <= 1.0
 
 
+class TestFusionModel:
+    def test_output_shape(self):
+        model  = TomatoFusionModel(num_classes=4)
+        output = model(DUMMY)
+        assert output.shape == (BATCH, 4)
+
+    def test_num_classes(self):
+        for n in [2, 4, 8]:
+            model  = TomatoFusionModel(num_classes=n)
+            output = model(DUMMY)
+            assert output.shape == (BATCH, n)
+
+    def test_backbone_frozen_phase1(self):
+        model      = TomatoFusionModel()
+        cnn_params = [p for p in model.cnn.parameters()]
+        assert not any(p.requires_grad for p in cnn_params)
+
+    def test_unfreeze_backbone(self):
+        model = TomatoFusionModel()
+        model.unfreeze_backbone(layers=["layer3", "layer4"])
+        unfrozen = [
+            p for n, p in model.cnn.named_parameters()
+            if "layer3" in n or "layer4" in n
+        ]
+        assert any(p.requires_grad for p in unfrozen)
+
+<<<<<<< Updated upstream
 def test_cnn_output_shape():
     assert os.path.exists(CNN_MODEL_PATH), "Model file missing"
     model = build_model()
@@ -149,3 +144,9 @@ def test_unet_output_shape():
         mask = model(dummy)
     assert mask.shape == (1, 1, IMG_SIZE[0], IMG_SIZE[1]), \
         f"Expected (1, 1, {IMG_SIZE[0]}, {IMG_SIZE[1]}), got {mask.shape}"
+=======
+    def test_leaf_density_range(self):
+        model = TomatoFusionModel()
+        lpf   = model.get_leaf_density(DUMMY[0:1])
+        assert 0.0 <= lpf <= 1.0
+>>>>>>> Stashed changes

@@ -9,3 +9,10 @@ outputs/
 .idea/
 .DS_Store
 Thumbs.db
+# Keep folder structure but ignore actual image/mask data
+roboflow_export/**/*.jpg
+roboflow_export/**/*.jpeg
+roboflow_export/**/*.png
+
+# Keep .gitkeep placeholder files
+!roboflow_export/**/.gitkeep

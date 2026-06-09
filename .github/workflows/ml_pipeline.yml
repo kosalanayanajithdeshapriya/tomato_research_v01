@@ -31,15 +31,40 @@ jobs:
           flake8 src/ --max-line-length=120 --select=E9,F63,F7,F82
 
       - name: Set CI training config
-        run: echo "CI=true" >> $GITHUB_ENV   # ← replaces broken sed commands
+        run: echo "CI=true" >> $GITHUB_ENV
 
+      # ── Create Sample Dataset ─────────────────────────────────────────────
+      # Creates dummy images + masks for CI testing
+      # Real data comes from Roboflow export during actual training
       - name: Create sample dataset for CI
         run: |
           python - <<'EOF'
           import os
           import numpy as np
           from PIL import Image
-          classes = ["developing", "flowering", "fruiting", "seeding"]  # ← fixed
+
+          classes = ["developing", "flowering", "fruiting", "seeding"]
+
+          # ── CNN images (raw) ───────────────────────────────────────────────
+          for split in ["train", "valid", "test"]:
+              for cls in classes:
+                  os.makedirs(f"roboflow_export/{split}/images", exist_ok=True)
+                  os.makedirs(f"roboflow_export/{split}/masks",  exist_ok=True)
+                  for i in range(5):
+                      # Raw image
+                      img = Image.fromarray(
+                          np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8)
+                      )
+                      fname = f"{cls}_img_{i:03d}"
+                      img.save(f"roboflow_export/{split}/images/{fname}.jpg")
+
+                      # Matching binary mask (white=leaf, black=background)
+                      mask = Image.fromarray(
+                          (np.random.rand(224, 224) > 0.5).astype(np.uint8) * 255
+                      )
+                      mask.save(f"roboflow_export/{split}/masks/{fname}.png")
+
+          # ── Legacy data/ folder (keep for backward compatibility) ──────────
           os.makedirs("data", exist_ok=True)
           for cls in classes:
               os.makedirs(f"data/{cls}", exist_ok=True)
@@ -48,24 +73,41 @@ jobs:
                       np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8)
                   )
                   img.save(f"data/{cls}/img_{i}.jpg")
-          print("Sample dataset created - 4 classes x 10 images")
+
+          print("✅ CI dataset created:")
+          print("   roboflow_export/ → train/valid/test with images + masks")
+          print("   data/            → legacy class folders")
           EOF
 
-      - name: Train model
+      # ── Stage 1: Train U-Net ──────────────────────────────────────────────
+      - name: Train U-Net segmentation model
+        run: python src/train_unet.py
+
+      # ── Stage 2: Train CNN classifier ────────────────────────────────────
+      - name: Train CNN classifier
         run: python src/train.py
 
+      # ── Run Tests ─────────────────────────────────────────────────────────
       - name: Run tests
         run: pytest tests/ -v
 
+      # ── Stage 3: Evaluate both models ────────────────────────────────────
       - name: Evaluate model
         run: python src/evaluate.py
 
+      # ── Upload all artifacts ──────────────────────────────────────────────
       - name: Upload model artifacts
         uses: actions/upload-artifact@v4
         with:
           name: tomato-model-artifacts
           path: outputs/
+          # Uploads:
+          #   outputs/models/unet_segmentation.pth  ← U-Net weights
+          #   outputs/models/cnn_classifier.pth      ← CNN weights
+          #   outputs/metrics.json                   ← both model metrics
+          #   outputs/plots/                         ← training curves
 
+      # ── Deploy (main branch only) ─────────────────────────────────────────
       - name: Deploy to Hugging Face
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         env:
