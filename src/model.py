@@ -1,7 +1,11 @@
 import torch
 import torch.nn as nn
 import torchvision.models as models
-from unet import UNet
+
+try:
+    from src.unet import UNet
+except ModuleNotFoundError:
+    from unet import UNet
 
 
 class TomatoFusionModel(nn.Module):
@@ -14,14 +18,16 @@ class TomatoFusionModel(nn.Module):
             base              = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
             self.cnn_features = nn.Sequential(*list(base.children())[:-1])
             cnn_dim           = 2048
+
         elif backbone == "densenet121":
             base              = models.densenet121(weights=models.DenseNet121_Weights.IMAGENET1K_V1)
             self.cnn_features = base.features
             cnn_dim           = 1024
+
         else:
             raise ValueError(f"Unsupported backbone: {backbone}")
 
-        self.cnn = self.cnn_features  # alias for train.py unfreeze_backbone
+        self.cnn = self.cnn_features
 
         for param in self.cnn_features.parameters():
             param.requires_grad = False
@@ -36,10 +42,10 @@ class TomatoFusionModel(nn.Module):
 
     def forward(self, x):
         mask     = self.unet(x)
-        lpf      = mask.mean(dim=[1, 2, 3]).unsqueeze(1)       # [B, 1]
+        lpf      = mask.mean(dim=[1, 2, 3]).unsqueeze(1)
         features = self.cnn_features(x)
-        features = features.view(features.size(0), -1)         # [B, 2048]
-        fused    = torch.cat([lpf, features], dim=1)           # [B, 2049]
+        features = features.view(features.size(0), -1)
+        fused    = torch.cat([lpf, features], dim=1)
         return self.fusion_head(fused)
 
     def unfreeze_backbone(self, layers=("layer3", "layer4")):
