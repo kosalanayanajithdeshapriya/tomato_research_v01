@@ -150,19 +150,21 @@ def load_data():
 # ── Model ─────────────────────────────────────────────────────────────────────
 def build_model():
     """
-    Builds TomatoFusionModel and replaces its classifier head.
-    This ensures the saved .pth is always a full TomatoFusionModel
-    so evaluate.py loads it without any mismatch.
+    Builds TomatoFusionModel and replaces the classifier head.
+    ResNet50 backbone always outputs 2048 features before the fc layer.
+    TomatoFusionModel uses nn.Identity() for fc, so we hardcode 2048.
     """
     print("[INFO] Building TomatoFusionModel (ResNet50 + U-Net)...")
     fusion = TomatoFusionModel(num_classes=NUM_CLASSES).to(DEVICE)
 
-    # Freeze everything first
+    # Freeze all parameters first
     for param in fusion.parameters():
         param.requires_grad = False
 
-    # Replace classifier head with richer head
-    in_features = fusion.cnn.fc.in_features
+    # ResNet50 always outputs 2048 features — Identity has no in_features attr
+    in_features = 2048
+
+    # Replace the fc layer with a richer classification head
     fusion.cnn.fc = nn.Sequential(
         nn.Linear(in_features, 512),
         nn.BatchNorm1d(512),
@@ -177,6 +179,10 @@ def build_model():
     # Only train the new head in Phase 1
     for param in fusion.cnn.fc.parameters():
         param.requires_grad = True
+
+    total_params     = sum(p.numel() for p in fusion.parameters())
+    trainable_params = sum(p.numel() for p in fusion.parameters() if p.requires_grad)
+    print(f"[INFO] Total params: {total_params:,} | Trainable: {trainable_params:,}")
 
     return fusion
 
@@ -230,7 +236,7 @@ def train():
     patience     = 7
 
     # ── Phase 1: Train head only ──────────────────────────────────────────
-    print("\n[INFO] Phase 1 - Training classification head...")
+    print("\n[INFO] Phase 1 - Training classification head only...")
     optimizer = torch.optim.Adam(
         filter(lambda p: p.requires_grad, model.parameters()), lr=LR_PHASE1
     )
@@ -252,7 +258,6 @@ def train():
 
         if vl_acc >= best_val_acc:
             best_val_acc = vl_acc
-            # Save full TomatoFusionModel — evaluate.py can load directly
             torch.save(model.state_dict(), CNN_MODEL_PATH)
             no_improve = 0
         else:
@@ -298,10 +303,12 @@ def train():
                 print(f"[INFO] Early stopping at epoch {epoch}")
                 break
 
+    # Load best checkpoint
     if os.path.exists(CNN_MODEL_PATH):
         model.load_state_dict(
             torch.load(CNN_MODEL_PATH, weights_only=True, map_location=DEVICE)
         )
+        print(f"[INFO] Best model loaded from {CNN_MODEL_PATH}")
     else:
         print("[WARN] No saved model found, using last epoch weights")
 
