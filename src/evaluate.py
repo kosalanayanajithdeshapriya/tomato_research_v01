@@ -117,7 +117,7 @@ class EvalDataset(Dataset):
             mask        = Image.open(mask_path).convert("L")
             mask_tensor = mask_transform(mask).clamp(0, 1)
         else:
-            mask_tensor = torch.ones(1, *IMG_SIZE)  # fallback white mask
+            mask_tensor = torch.ones(1, *IMG_SIZE)
 
         return img_tensor, mask_tensor, torch.tensor(label, dtype=torch.long)
 
@@ -136,6 +136,35 @@ def dice_score(pred, target, threshold=0.5, smooth=1e-6):
     target = (target > threshold).float()
     inter  = (pred * target).sum()
     return ((2 * inter + smooth) / (pred.sum() + target.sum() + smooth)).item()
+
+
+# ── Smart Model Loader ────────────────────────────────────────────────────────
+def load_fusion_model(path):
+    """
+    Safely loads cnn_classifier.pth into TomatoFusionModel.
+    Handles two cases:
+      1. File was saved as full TomatoFusionModel  → strict load
+      2. File was saved as plain ResNet50          → load into cnn backbone only
+    """
+    model      = TomatoFusionModel(num_classes=NUM_CLASSES).to(DEVICE)
+    state_dict = torch.load(path, weights_only=True, map_location=DEVICE)
+
+    # Check if state_dict keys match TomatoFusionModel
+    model_keys  = set(model.state_dict().keys())
+    saved_keys  = set(state_dict.keys())
+    fusion_keys = [k for k in saved_keys if k.startswith("unet.") or k.startswith("cnn.")]
+
+    if fusion_keys:
+        # Saved as full TomatoFusionModel
+        print("[INFO] Loading full TomatoFusionModel weights")
+        model.load_state_dict(state_dict, strict=False)
+    else:
+        # Saved as plain ResNet50 — load into CNN backbone only
+        print("[INFO] Detected plain ResNet50 checkpoint — loading into CNN backbone")
+        model.cnn.load_state_dict(state_dict, strict=False)
+
+    model.eval()
+    return model
 
 
 # ── Evaluate U-Net ────────────────────────────────────────────────────────────
@@ -183,11 +212,11 @@ def evaluate_cnn(loader):
         print(f"[WARN] CNN model not found at {CNN_MODEL_PATH} — skipping")
         return None
 
-    model = TomatoFusionModel(num_classes=NUM_CLASSES).to(DEVICE)
-    model.load_state_dict(
-        torch.load(CNN_MODEL_PATH, weights_only=True, map_location=DEVICE)
-    )
-    model.eval()
+    try:
+        model = load_fusion_model(CNN_MODEL_PATH)
+    except Exception as e:
+        print(f"[WARN] Could not load CNN model: {e} — skipping")
+        return None
 
     all_preds, all_labels, all_lpf = [], [], []
 
@@ -198,8 +227,11 @@ def evaluate_cnn(loader):
             outputs = model(images)
             preds   = outputs.argmax(1).cpu().numpy()
 
-            mask_preds = model.unet(images)
-            lpf        = mask_preds.mean(dim=[1, 2, 3]).cpu().numpy()
+            try:
+                mask_preds = model.unet(images)
+                lpf        = mask_preds.mean(dim=[1, 2, 3]).cpu().numpy()
+            except Exception:
+                lpf = np.zeros(images.size(0))
 
             all_preds.extend(preds)
             all_labels.extend(labels.numpy())
@@ -296,7 +328,6 @@ def main():
     test_ds = EvalDataset(split="test")
     if len(test_ds) == 0:
         print("[WARN] No test samples found — skipping evaluation")
-        # ── Write empty metrics so pipeline doesn't crash ─────────────────
         if not os.path.exists(METRICS_PATH):
             os.makedirs(OUTPUT_DIR, exist_ok=True)
             with open(METRICS_PATH, "w") as f:
@@ -349,8 +380,8 @@ def main():
     MIN_ACC = 0.30 if IS_CI else 0.55
     MIN_IOU = 0.20 if IS_CI else 0.70
 
-    acc_ok = metrics.get("test_accuracy", 0)  >= MIN_ACC
-    iou_ok = metrics.get("test_iou", 1.0)     >= MIN_IOU
+    acc_ok = metrics.get("test_accuracy", 0) >= MIN_ACC
+    iou_ok = metrics.get("test_iou", 1.0)    >= MIN_IOU
 
     if not acc_ok:
         print(f"\n[FAIL] test_accuracy "

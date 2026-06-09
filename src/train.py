@@ -1,15 +1,22 @@
 import os
+import sys
+
+# ── Fix src module resolution (works locally and in CI) ──────────────────────
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import json
 import torch
 import torch.nn as nn
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
-from torch.utils.data import DataLoader, random_split, Subset
+from torch.utils.data import DataLoader, Subset
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import precision_score, recall_score, f1_score, classification_report
 import numpy as np
+
+from src.model import TomatoFusionModel
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -73,14 +80,12 @@ def load_data():
     indices = list(range(len(full_train_ds)))
     total   = len(indices)
 
-    # FIX: In CI tiny dataset — skip stratification to avoid crash
     min_class_count = min(labels.count(i) for i in range(NUM_CLASSES))
     use_stratify    = (not IS_CI) and (min_class_count >= 3)
 
     if not use_stratify:
         print("[INFO] Stratification disabled (CI mode or insufficient class samples)")
 
-    # Step 1: Split 10% test
     train_val_idx, test_idx = train_test_split(
         indices,
         test_size=max(1, int(total * 0.10)),
@@ -88,7 +93,6 @@ def load_data():
         random_state=42
     )
 
-    # Step 2: Split remaining 90% → 70% train / 20% val
     train_val_labels = [labels[i] for i in train_val_idx]
     train_idx, val_idx = train_test_split(
         train_val_idx,
@@ -97,12 +101,10 @@ def load_data():
         random_state=42
     )
 
-    # Train gets augmentation, val/test do NOT
     train_ds = Subset(full_train_ds, train_idx)
     val_ds   = Subset(full_val_ds,   val_idx)
     test_ds  = Subset(full_val_ds,   test_idx)
 
-    # Print per-class distribution
     print(f"\n{'Split':<8} {'Total':>6}  ", end="")
     for cls in full_train_ds.classes:
         print(f"{cls:>12}", end="")
@@ -118,7 +120,6 @@ def load_data():
         print()
     print()
 
-    # Save split indices so evaluate.py reuses exact same test set
     split_info = {"train_idx": train_idx, "val_idx": val_idx, "test_idx": test_idx}
     with open(os.path.join(OUTPUT_DIR, "split_indices.json"), "w") as f:
         json.dump(split_info, f)
@@ -148,14 +149,22 @@ def load_data():
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 def build_model():
-    print("[INFO] Building ResNet50 model...")
-    model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
+    """
+    Builds TomatoFusionModel and replaces its classifier head.
+    This ensures the saved .pth is always a full TomatoFusionModel
+    so evaluate.py loads it without any mismatch.
+    """
+    print("[INFO] Building TomatoFusionModel (ResNet50 + U-Net)...")
+    fusion = TomatoFusionModel(num_classes=NUM_CLASSES).to(DEVICE)
 
-    for param in model.parameters():
+    # Freeze everything first
+    for param in fusion.parameters():
         param.requires_grad = False
 
-    model.fc = nn.Sequential(
-        nn.Linear(model.fc.in_features, 512),
+    # Replace classifier head with richer head
+    in_features = fusion.cnn.fc.in_features
+    fusion.cnn.fc = nn.Sequential(
+        nn.Linear(in_features, 512),
         nn.BatchNorm1d(512),
         nn.ReLU(),
         nn.Dropout(0.4),
@@ -163,8 +172,13 @@ def build_model():
         nn.ReLU(),
         nn.Dropout(0.3),
         nn.Linear(256, NUM_CLASSES)
-    )
-    return model.to(DEVICE)
+    ).to(DEVICE)
+
+    # Only train the new head in Phase 1
+    for param in fusion.cnn.fc.parameters():
+        param.requires_grad = True
+
+    return fusion
 
 
 # ── Train One Epoch ───────────────────────────────────────────────────────────
@@ -175,12 +189,12 @@ def train_epoch(model, loader, optimizer, criterion):
         images, labels = images.to(DEVICE), labels.to(DEVICE)
         optimizer.zero_grad()
         outputs = model(images)
-        loss = criterion(outputs, labels)
+        loss    = criterion(outputs, labels)
         loss.backward()
         optimizer.step()
         total_loss += loss.item()
-        correct += (outputs.argmax(1) == labels).sum().item()
-        total   += labels.size(0)
+        correct    += (outputs.argmax(1) == labels).sum().item()
+        total      += labels.size(0)
     return total_loss / len(loader), correct / total
 
 
@@ -196,8 +210,8 @@ def validate(model, loader, criterion):
             loss    = criterion(outputs, labels)
             total_loss += loss.item()
             preds = outputs.argmax(1)
-            correct += (preds == labels).sum().item()
-            total   += labels.size(0)
+            correct    += (preds == labels).sum().item()
+            total      += labels.size(0)
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
     return total_loss / len(loader), correct / total, all_preds, all_labels
@@ -215,14 +229,16 @@ def train():
     no_improve   = 0
     patience     = 7
 
-    # ── Phase 1: Head only ────────────────────────────────────────────────
+    # ── Phase 1: Train head only ──────────────────────────────────────────
     print("\n[INFO] Phase 1 - Training classification head...")
-    optimizer = torch.optim.Adam(model.fc.parameters(), lr=LR_PHASE1)
+    optimizer = torch.optim.Adam(
+        filter(lambda p: p.requires_grad, model.parameters()), lr=LR_PHASE1
+    )
     scheduler = ReduceLROnPlateau(optimizer, factor=0.5, patience=3)
 
     for epoch in range(1, EPOCHS_PHASE1 + 1):
-        tr_loss, tr_acc        = train_epoch(model, train_loader, optimizer, criterion)
-        vl_loss, vl_acc, _, _  = validate(model, val_loader, criterion)
+        tr_loss, tr_acc       = train_epoch(model, train_loader, optimizer, criterion)
+        vl_loss, vl_acc, _, _ = validate(model, val_loader, criterion)
         scheduler.step(vl_loss)
 
         history["train_acc"].append(tr_acc)
@@ -236,6 +252,7 @@ def train():
 
         if vl_acc >= best_val_acc:
             best_val_acc = vl_acc
+            # Save full TomatoFusionModel — evaluate.py can load directly
             torch.save(model.state_dict(), CNN_MODEL_PATH)
             no_improve = 0
         else:
@@ -244,9 +261,9 @@ def train():
                 print(f"[INFO] Early stopping at epoch {epoch}")
                 break
 
-    # ── Phase 2: Fine-tune top ResNet layers ──────────────────────────────
+    # ── Phase 2: Fine-tune layer3 + layer4 + fc ───────────────────────────
     print("\n[INFO] Phase 2 - Fine-tuning top ResNet50 layers...")
-    for name, param in model.named_parameters():
+    for name, param in model.cnn.named_parameters():
         if "layer4" in name or "layer3" in name or "fc" in name:
             param.requires_grad = True
 
@@ -281,9 +298,10 @@ def train():
                 print(f"[INFO] Early stopping at epoch {epoch}")
                 break
 
-    # FIX: weights_only=True — removes FutureWarning
     if os.path.exists(CNN_MODEL_PATH):
-        model.load_state_dict(torch.load(CNN_MODEL_PATH, weights_only=True))
+        model.load_state_dict(
+            torch.load(CNN_MODEL_PATH, weights_only=True, map_location=DEVICE)
+        )
     else:
         print("[WARN] No saved model found, using last epoch weights")
 
@@ -295,7 +313,6 @@ def train():
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    import sys
     model, history, preds, labels, val_acc, classes = train()
 
     precision = precision_score(labels, preds, average="weighted", zero_division=0)
@@ -326,14 +343,12 @@ def main():
     for k, v in metrics.items():
         print(f"  {k}: {v}")
 
-    # FIX: use IS_CI-aware MIN_ACCURACY for status print
     status = "PASS" if val_acc >= MIN_ACCURACY else "FAIL"
     print(f"\n[{status}] val_accuracy {val_acc:.4f} "
           f"{'≥' if val_acc >= MIN_ACCURACY else '<'} threshold {MIN_ACCURACY}")
     print("[INFO] Training complete.")
     print("[INFO] Run python src/evaluate.py for final TEST set results.")
 
-    # FIX: never exit(1) in CI — random data makes accuracy meaningless
     if val_acc < MIN_ACCURACY and not IS_CI:
         sys.exit(1)
 
