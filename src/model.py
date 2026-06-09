@@ -1,13 +1,9 @@
-import os
-import sys
-
-# ── Fix src module resolution (works locally and in CI) ──────────────────────
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 import torch
 import torch.nn as nn
 import torchvision.models as models
-from src.unet import UNet   # ← correct, NOT from src.model
+
+# Relative import — both files are in src/, no sys.path needed
+from unet import UNet
 
 
 class TomatoFusionModel(nn.Module):
@@ -19,12 +15,12 @@ class TomatoFusionModel(nn.Module):
 
         # ── Branch 2: CNN Backbone ────────────────────────────────────────
         if backbone == "resnet50":
-            base         = models.resnet50(
+            base        = models.resnet50(
                 weights=models.ResNet50_Weights.IMAGENET1K_V1
             )
-            self.cnn     = base
-            self.cnn.fc  = nn.Identity()
-            cnn_dim      = 2048
+            self.cnn    = base
+            self.cnn.fc = nn.Identity()   # outputs [B, 2048]
+            cnn_dim     = 2048
 
         elif backbone == "densenet121":
             base                = models.densenet121(
@@ -42,7 +38,7 @@ class TomatoFusionModel(nn.Module):
             param.requires_grad = False
 
         # ── Feature Fusion Head ───────────────────────────────────────────
-        # cnn outputs [B, 2048], unet lpf outputs [B, 1] → concat = [B, 2049]
+        # cnn → [B, 2048]  +  unet lpf → [B, 1]  =  [B, 2049]
         self.fusion_head = nn.Sequential(
             nn.Linear(cnn_dim + 1, 256),
             nn.BatchNorm1d(256),
@@ -52,11 +48,11 @@ class TomatoFusionModel(nn.Module):
         )
 
     def forward(self, x):
-        # ── Branch 1: Leaf Area Density ───────────────────────────────────
+        # ── U-Net: Leaf Pixel Fraction ────────────────────────────────────
         mask = self.unet(x)                            # [B, 1, 224, 224]
         lpf  = mask.mean(dim=[1, 2, 3]).unsqueeze(1)   # [B, 1]
 
-        # ── Branch 2: Visual Features ─────────────────────────────────────
+        # ── CNN: Visual Features ──────────────────────────────────────────
         features = self.cnn(x)                         # [B, 2048]
         if features.dim() == 4:
             features = features.view(features.size(0), -1)
