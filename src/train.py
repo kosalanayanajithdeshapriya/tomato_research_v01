@@ -1,7 +1,6 @@
 import os
 import sys
 
-# ── Fix src module resolution (works locally and in CI) ──────────────────────
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import json
@@ -9,7 +8,6 @@ import torch
 import torch.nn as nn
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
-import torchvision.models as models
 from torch.utils.data import DataLoader, Subset
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from sklearn.model_selection import train_test_split
@@ -103,7 +101,6 @@ def load_data():
 
     train_ds = Subset(full_train_ds, train_idx)
     val_ds   = Subset(full_val_ds,   val_idx)
-    test_ds  = Subset(full_val_ds,   test_idx)
 
     print(f"\n{'Split':<8} {'Total':>6}  ", end="")
     for cls in full_train_ds.classes:
@@ -149,42 +146,20 @@ def load_data():
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 def build_model():
-    """
-    Builds TomatoFusionModel and replaces the classifier head.
-    ResNet50 backbone always outputs 2048 features before the fc layer.
-    TomatoFusionModel uses nn.Identity() for fc, so we hardcode 2048.
-    """
     print("[INFO] Building TomatoFusionModel (ResNet50 + U-Net)...")
-    fusion = TomatoFusionModel(num_classes=NUM_CLASSES).to(DEVICE)
+    model = TomatoFusionModel(num_classes=NUM_CLASSES).to(DEVICE)
 
-    # Freeze all parameters first
-    for param in fusion.parameters():
-        param.requires_grad = False
-
-    # ResNet50 always outputs 2048 features — Identity has no in_features attr
-    in_features = 2048
-
-    # Replace the fc layer with a richer classification head
-    fusion.cnn.fc = nn.Sequential(
-        nn.Linear(in_features, 512),
-        nn.BatchNorm1d(512),
-        nn.ReLU(),
-        nn.Dropout(0.4),
-        nn.Linear(512, 256),
-        nn.ReLU(),
-        nn.Dropout(0.3),
-        nn.Linear(256, NUM_CLASSES)
-    ).to(DEVICE)
-
-    # Only train the new head in Phase 1
-    for param in fusion.cnn.fc.parameters():
+    for param in model.fusion_head.parameters():
         param.requires_grad = True
 
-    total_params     = sum(p.numel() for p in fusion.parameters())
-    trainable_params = sum(p.numel() for p in fusion.parameters() if p.requires_grad)
+    for param in model.unet.parameters():
+        param.requires_grad = False
+
+    total_params     = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[INFO] Total params: {total_params:,} | Trainable: {trainable_params:,}")
 
-    return fusion
+    return model
 
 
 # ── Train One Epoch ───────────────────────────────────────────────────────────
@@ -235,8 +210,8 @@ def train():
     no_improve   = 0
     patience     = 7
 
-    # ── Phase 1: Train head only ──────────────────────────────────────────
-    print("\n[INFO] Phase 1 - Training classification head only...")
+    # ── Phase 1: fusion_head only ─────────────────────────────────────────
+    print("\n[INFO] Phase 1 - Training fusion head only...")
     optimizer = torch.optim.Adam(
         filter(lambda p: p.requires_grad, model.parameters()), lr=LR_PHASE1
     )
@@ -266,11 +241,9 @@ def train():
                 print(f"[INFO] Early stopping at epoch {epoch}")
                 break
 
-    # ── Phase 2: Fine-tune layer3 + layer4 + fc ───────────────────────────
-    print("\n[INFO] Phase 2 - Fine-tuning top ResNet50 layers...")
-    for name, param in model.cnn.named_parameters():
-        if "layer4" in name or "layer3" in name or "fc" in name:
-            param.requires_grad = True
+    # ── Phase 2: layer3 + layer4 + fusion_head ────────────────────────────
+    print("\n[INFO] Phase 2 - Fine-tuning layer3, layer4 + fusion head...")
+    model.unfreeze_backbone(layers=["layer3", "layer4"])
 
     optimizer  = torch.optim.Adam(
         filter(lambda p: p.requires_grad, model.parameters()), lr=LR_PHASE2
@@ -303,7 +276,6 @@ def train():
                 print(f"[INFO] Early stopping at epoch {epoch}")
                 break
 
-    # Load best checkpoint
     if os.path.exists(CNN_MODEL_PATH):
         model.load_state_dict(
             torch.load(CNN_MODEL_PATH, weights_only=True, map_location=DEVICE)

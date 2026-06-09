@@ -1,12 +1,10 @@
 import os
 import sys
 
-# ── Fix src module resolution (works locally and in CI) ──────────────────────
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import json
 import torch
-import torch.nn as nn
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
@@ -20,7 +18,6 @@ from sklearn.metrics import (
     accuracy_score,
 )
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 
 from src.unet import UNet
 from src.model import TomatoFusionModel
@@ -63,10 +60,6 @@ mask_transform = transforms.Compose([
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
 class EvalDataset(Dataset):
-    """
-    Loads test split from Roboflow export.
-    Returns (img_tensor, mask_tensor, label) per sample.
-    """
     def __init__(self, split="test"):
         self.samples = []
         img_dir  = os.path.join(ROBOFLOW_DIR, split, "images")
@@ -109,7 +102,6 @@ class EvalDataset(Dataset):
 
     def __getitem__(self, idx):
         img_path, mask_path, label = self.samples[idx]
-
         image      = Image.open(img_path).convert("RGB")
         img_tensor = img_transform(image)
 
@@ -122,7 +114,7 @@ class EvalDataset(Dataset):
         return img_tensor, mask_tensor, torch.tensor(label, dtype=torch.long)
 
 
-# ── IoU & Dice Metrics ────────────────────────────────────────────────────────
+# ── IoU & Dice ────────────────────────────────────────────────────────────────
 def iou_score(pred, target, threshold=0.5):
     pred   = (pred > threshold).float()
     target = (target > threshold).float()
@@ -136,35 +128,6 @@ def dice_score(pred, target, threshold=0.5, smooth=1e-6):
     target = (target > threshold).float()
     inter  = (pred * target).sum()
     return ((2 * inter + smooth) / (pred.sum() + target.sum() + smooth)).item()
-
-
-# ── Smart Model Loader ────────────────────────────────────────────────────────
-def load_fusion_model(path):
-    """
-    Safely loads cnn_classifier.pth into TomatoFusionModel.
-    Handles two cases:
-      1. File was saved as full TomatoFusionModel  → strict load
-      2. File was saved as plain ResNet50          → load into cnn backbone only
-    """
-    model      = TomatoFusionModel(num_classes=NUM_CLASSES).to(DEVICE)
-    state_dict = torch.load(path, weights_only=True, map_location=DEVICE)
-
-    # Check if state_dict keys match TomatoFusionModel
-    model_keys  = set(model.state_dict().keys())
-    saved_keys  = set(state_dict.keys())
-    fusion_keys = [k for k in saved_keys if k.startswith("unet.") or k.startswith("cnn.")]
-
-    if fusion_keys:
-        # Saved as full TomatoFusionModel
-        print("[INFO] Loading full TomatoFusionModel weights")
-        model.load_state_dict(state_dict, strict=False)
-    else:
-        # Saved as plain ResNet50 — load into CNN backbone only
-        print("[INFO] Detected plain ResNet50 checkpoint — loading into CNN backbone")
-        model.cnn.load_state_dict(state_dict, strict=False)
-
-    model.eval()
-    return model
 
 
 # ── Evaluate U-Net ────────────────────────────────────────────────────────────
@@ -182,13 +145,11 @@ def evaluate_unet(loader):
     model.eval()
 
     total_iou, total_dice, count = 0, 0, 0
-
     with torch.no_grad():
         for images, masks, _ in loader:
             images = images.to(DEVICE)
             masks  = masks.to(DEVICE)
             preds  = model(images)
-
             for i in range(preds.size(0)):
                 total_iou  += iou_score(preds[i], masks[i])
                 total_dice += dice_score(preds[i], masks[i])
@@ -204,7 +165,7 @@ def evaluate_unet(loader):
     return {"test_iou": round(avg_iou, 4), "test_dice": round(avg_dice, 4)}
 
 
-# ── Evaluate CNN / Fusion Model ───────────────────────────────────────────────
+# ── Evaluate Fusion Model ─────────────────────────────────────────────────────
 def evaluate_cnn(loader):
     print("\n[INFO] Evaluating Fusion model classification...")
 
@@ -213,7 +174,11 @@ def evaluate_cnn(loader):
         return None
 
     try:
-        model = load_fusion_model(CNN_MODEL_PATH)
+        model = TomatoFusionModel(num_classes=NUM_CLASSES).to(DEVICE)
+        model.load_state_dict(
+            torch.load(CNN_MODEL_PATH, weights_only=True, map_location=DEVICE)
+        )
+        model.eval()
     except Exception as e:
         print(f"[WARN] Could not load CNN model: {e} — skipping")
         return None
@@ -223,7 +188,6 @@ def evaluate_cnn(loader):
     with torch.no_grad():
         for images, masks, labels in loader:
             images = images.to(DEVICE)
-
             outputs = model(images)
             preds   = outputs.argmax(1).cpu().numpy()
 
@@ -238,12 +202,9 @@ def evaluate_cnn(loader):
             all_lpf.extend(lpf)
 
     acc       = accuracy_score(all_labels, all_preds)
-    precision = precision_score(all_labels, all_preds,
-                                average="weighted", zero_division=0)
-    recall    = recall_score(all_labels, all_preds,
-                             average="weighted", zero_division=0)
-    f1        = f1_score(all_labels, all_preds,
-                         average="weighted", zero_division=0)
+    precision = precision_score(all_labels, all_preds, average="weighted", zero_division=0)
+    recall    = recall_score(all_labels, all_preds,    average="weighted", zero_division=0)
+    f1        = f1_score(all_labels, all_preds,        average="weighted", zero_division=0)
 
     print(f"\n── Classification Report ────────────────")
     print(classification_report(
@@ -255,10 +216,8 @@ def evaluate_cnn(loader):
 
     print("── Avg Leaf Density (LPF) per Class ─────")
     for cls_idx, cls_name in enumerate(CLASS_NAMES):
-        cls_lpf = [all_lpf[i] for i in range(len(all_labels))
-                   if all_labels[i] == cls_idx]
-        avg = np.mean(cls_lpf) if cls_lpf else 0
-        print(f"  {cls_name:<12}: {avg:.4f}")
+        cls_lpf = [all_lpf[i] for i in range(len(all_labels)) if all_labels[i] == cls_idx]
+        print(f"  {cls_name:<12}: {np.mean(cls_lpf):.4f}" if cls_lpf else f"  {cls_name:<12}: N/A")
 
     return {
         "test_accuracy":  round(acc, 4),
@@ -268,31 +227,22 @@ def evaluate_cnn(loader):
     }, all_labels, all_preds, all_lpf
 
 
-# ── Plot Confusion Matrix ─────────────────────────────────────────────────────
+# ── Plots ─────────────────────────────────────────────────────────────────────
 def plot_confusion_matrix(labels, preds):
     cm      = confusion_matrix(labels, preds)
     fig, ax = plt.subplots(figsize=(7, 6))
     im      = ax.imshow(cm, interpolation="nearest", cmap=plt.cm.Blues)
     plt.colorbar(im, ax=ax)
-
-    ax.set(
-        xticks=np.arange(NUM_CLASSES),
-        yticks=np.arange(NUM_CLASSES),
-        xticklabels=CLASS_NAMES,
-        yticklabels=CLASS_NAMES,
-        title="Confusion Matrix — Test Set",
-        ylabel="True Label",
-        xlabel="Predicted Label",
-    )
+    ax.set(xticks=np.arange(NUM_CLASSES), yticks=np.arange(NUM_CLASSES),
+           xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES,
+           title="Confusion Matrix — Test Set",
+           ylabel="True Label", xlabel="Predicted Label")
     plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
-
     thresh = cm.max() / 2
     for i in range(cm.shape[0]):
         for j in range(cm.shape[1]):
-            ax.text(j, i, format(cm[i, j], "d"),
-                    ha="center", va="center",
+            ax.text(j, i, format(cm[i, j], "d"), ha="center", va="center",
                     color="white" if cm[i, j] > thresh else "black")
-
     plt.tight_layout()
     path = os.path.join(PLOTS_DIR, "confusion_matrix.png")
     plt.savefig(path, dpi=150)
@@ -300,23 +250,18 @@ def plot_confusion_matrix(labels, preds):
     print(f"[INFO] Confusion matrix saved → {path}")
 
 
-# ── Plot Leaf Density Distribution ───────────────────────────────────────────
 def plot_leaf_density(labels, lpf_scores):
     fig, ax = plt.subplots(figsize=(9, 5))
     colors  = ["#2ecc71", "#3498db", "#e67e22", "#e74c3c"]
-
     for cls_idx, (cls_name, color) in enumerate(zip(CLASS_NAMES, colors)):
-        vals = [lpf_scores[i] for i in range(len(labels))
-                if labels[i] == cls_idx]
+        vals = [lpf_scores[i] for i in range(len(labels)) if labels[i] == cls_idx]
         if vals:
             ax.hist(vals, bins=20, alpha=0.6, color=color, label=cls_name)
-
     ax.set_xlabel("Leaf Pixel Fraction (LPF)")
     ax.set_ylabel("Count")
     ax.set_title("Leaf Density Distribution per Growth Stage")
     ax.legend()
     plt.tight_layout()
-
     path = os.path.join(PLOTS_DIR, "leaf_density_distribution.png")
     plt.savefig(path, dpi=150)
     plt.close()
@@ -332,13 +277,9 @@ def main():
             os.makedirs(OUTPUT_DIR, exist_ok=True)
             with open(METRICS_PATH, "w") as f:
                 json.dump({
-                    "val_accuracy":   0.0,
-                    "train_accuracy": 0.0,
-                    "f1_score":       0.0,
-                    "precision":      0.0,
-                    "recall":         0.0,
-                    "test_accuracy":  0.0,
-                    "test_iou":       1.0,
+                    "val_accuracy": 0.0, "train_accuracy": 0.0,
+                    "f1_score": 0.0, "precision": 0.0,
+                    "recall": 0.0, "test_accuracy": 0.0, "test_iou": 1.0,
                 }, f, indent=4)
             print(f"[INFO] Empty metrics written → {METRICS_PATH}")
         return
@@ -346,8 +287,7 @@ def main():
     test_loader = DataLoader(
         test_ds,
         batch_size=min(BATCH_SIZE, len(test_ds)),
-        shuffle=False,
-        num_workers=0,
+        shuffle=False, num_workers=0,
         pin_memory=(DEVICE.type == "cuda")
     )
 
@@ -364,7 +304,6 @@ def main():
     if cnn_result:
         cnn_metrics, labels, preds, lpf_scores = cnn_result
         metrics.update(cnn_metrics)
-
         if not IS_CI:
             plot_confusion_matrix(labels, preds)
             plot_leaf_density(labels, lpf_scores)
@@ -384,12 +323,9 @@ def main():
     iou_ok = metrics.get("test_iou", 1.0)    >= MIN_IOU
 
     if not acc_ok:
-        print(f"\n[FAIL] test_accuracy "
-              f"{metrics.get('test_accuracy', 0):.4f} < {MIN_ACC}")
+        print(f"\n[FAIL] test_accuracy {metrics.get('test_accuracy', 0):.4f} < {MIN_ACC}")
     if not iou_ok:
-        print(f"[FAIL] test_iou "
-              f"{metrics.get('test_iou', 0):.4f} < {MIN_IOU}")
-
+        print(f"[FAIL] test_iou {metrics.get('test_iou', 0):.4f} < {MIN_IOU}")
     if acc_ok and iou_ok:
         print("\n[PASS] All evaluation thresholds met ✅")
 

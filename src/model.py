@@ -1,8 +1,6 @@
 import torch
 import torch.nn as nn
 import torchvision.models as models
-
-# Relative import — both files are in src/, no sys.path needed
 from unet import UNet
 
 
@@ -10,35 +8,24 @@ class TomatoFusionModel(nn.Module):
     def __init__(self, num_classes=4, backbone="resnet50"):
         super().__init__()
 
-        # ── Branch 1: U-Net ───────────────────────────────────────────────
         self.unet = UNet(in_channels=3, out_channels=1)
 
-        # ── Branch 2: CNN Backbone ────────────────────────────────────────
         if backbone == "resnet50":
-            base        = models.resnet50(
-                weights=models.ResNet50_Weights.IMAGENET1K_V1
-            )
-            self.cnn    = base
-            self.cnn.fc = nn.Identity()   # outputs [B, 2048]
-            cnn_dim     = 2048
-
+            base              = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
+            self.cnn_features = nn.Sequential(*list(base.children())[:-1])
+            cnn_dim           = 2048
         elif backbone == "densenet121":
-            base                = models.densenet121(
-                weights=models.DenseNet121_Weights.IMAGENET1K_V1
-            )
-            self.cnn            = base
-            self.cnn.classifier = nn.Identity()
-            cnn_dim             = 1024
-
+            base              = models.densenet121(weights=models.DenseNet121_Weights.IMAGENET1K_V1)
+            self.cnn_features = base.features
+            cnn_dim           = 1024
         else:
             raise ValueError(f"Unsupported backbone: {backbone}")
 
-        # Freeze ALL CNN params — Phase 1 trains only fusion_head
-        for param in self.cnn.parameters():
+        self.cnn = self.cnn_features  # alias for train.py unfreeze_backbone
+
+        for param in self.cnn_features.parameters():
             param.requires_grad = False
 
-        # ── Feature Fusion Head ───────────────────────────────────────────
-        # cnn → [B, 2048]  +  unet lpf → [B, 1]  =  [B, 2049]
         self.fusion_head = nn.Sequential(
             nn.Linear(cnn_dim + 1, 256),
             nn.BatchNorm1d(256),
@@ -48,28 +35,24 @@ class TomatoFusionModel(nn.Module):
         )
 
     def forward(self, x):
-        # ── U-Net: Leaf Pixel Fraction ────────────────────────────────────
-        mask = self.unet(x)                            # [B, 1, 224, 224]
-        lpf  = mask.mean(dim=[1, 2, 3]).unsqueeze(1)   # [B, 1]
-
-        # ── CNN: Visual Features ──────────────────────────────────────────
-        features = self.cnn(x)                         # [B, 2048]
-        if features.dim() == 4:
-            features = features.view(features.size(0), -1)
-
-        # ── Fusion ────────────────────────────────────────────────────────
-        fused = torch.cat([lpf, features], dim=1)      # [B, 2049]
-        return self.fusion_head(fused)                 # [B, num_classes]
+        mask     = self.unet(x)
+        lpf      = mask.mean(dim=[1, 2, 3]).unsqueeze(1)       # [B, 1]
+        features = self.cnn_features(x)
+        features = features.view(features.size(0), -1)         # [B, 2048]
+        fused    = torch.cat([lpf, features], dim=1)           # [B, 2049]
+        return self.fusion_head(fused)
 
     def unfreeze_backbone(self, layers=("layer3", "layer4")):
-        for name, param in self.cnn.named_parameters():
-            if any(layer in name for layer in layers):
-                param.requires_grad = True
+        layer_map = {"layer1": 4, "layer2": 5, "layer3": 6, "layer4": 7}
+        for layer in layers:
+            idx = layer_map.get(layer, -1)
+            if idx >= 0:
+                for param in self.cnn_features[idx].parameters():
+                    param.requires_grad = True
         print(f"[INFO] Unfroze CNN layers: {list(layers)}")
 
     def get_leaf_density(self, x):
         self.eval()
         with torch.no_grad():
             mask = self.unet(x)
-            lpf  = mask.mean(dim=[1, 2, 3])
-        return round(lpf.item(), 4)
+        return round(mask.mean(dim=[1, 2, 3]).item(), 4)
