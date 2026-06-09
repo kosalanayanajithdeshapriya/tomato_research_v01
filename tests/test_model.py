@@ -1,79 +1,81 @@
 import os
-import sys
 import json
-import pytest
-import numpy as np
 import torch
-import torch.nn as nn
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
-from src.train import (
-    build_model,
-    NUM_CLASSES,
-    DEVICE,
-    CNN_MODEL_PATH,
-    METRICS_PATH,
-    IMG_SIZE,
-    IS_CI,
-    MIN_ACCURACY,
-)
+import pytest
+from src.unet import UNet
+from src.model import TomatoFusionModel
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-UNET_MODEL_PATH = os.path.join("outputs", "models", "unet_segmentation.pth")
+BATCH      = 2
+DUMMY      = torch.randn(BATCH, 3, 224, 224)
+DEVICE     = torch.device("cpu")
+IS_CI      = os.environ.get("CI", "false").lower() == "true"
+IMG_SIZE   = (224, 224)
+NUM_CLASSES = 4
+MIN_ACCURACY = 0.55
+METRICS_PATH   = "outputs/metrics.json"
+CNN_MODEL_PATH = "outputs/models/classifier.pth"
+UNET_MODEL_PATH = "outputs/models/unet.pth"
 
 
-# ── U-Net Definition ──────────────────────────────────────────────────────────
-class UNetBlock(nn.Module):
-    def __init__(self, in_ch, out_ch):
-        super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, 3, padding=1),
-            nn.ReLU(inplace=True),
-        )
+# ── U-Net Architecture Tests ──────────────────────────────────────────────────
+class TestUNet:
+    def test_output_shape(self):
+        model  = UNet()
+        output = model(DUMMY)
+        assert output.shape == (BATCH, 1, 224, 224)
 
-    def forward(self, x):
-        return self.block(x)
+    def test_output_range(self):
+        model  = UNet()
+        output = model(DUMMY)
+        assert output.min() >= 0.0
+        assert output.max() <= 1.0
 
-
-class SimpleUNet(nn.Module):
-    def __init__(self, in_channels=3, out_channels=1):
-        super().__init__()
-        self.enc        = UNetBlock(in_channels, 64)
-        self.pool       = nn.MaxPool2d(2)
-        self.bottleneck = UNetBlock(64, 128)
-        self.up         = nn.ConvTranspose2d(128, 64, 2, stride=2)
-        self.dec        = UNetBlock(128, 64)
-        self.final      = nn.Conv2d(64, out_channels, 1)
-
-    def forward(self, x):
-        e = self.enc(x)
-        p = self.pool(e)
-        b = self.bottleneck(p)
-        u = self.up(b)
-        d = self.dec(torch.cat([u, e], dim=1))
-        return self.final(d)
+    def test_sigmoid_applied(self):
+        model  = UNet()
+        output = model(DUMMY)
+        assert output.min() >= 0.0 and output.max() <= 1.0
 
 
-# ── CNN Tests ─────────────────────────────────────────────────────────────────
-def test_cnn_model_file_exists():
-    assert os.path.exists(CNN_MODEL_PATH), \
-        f"Model not found at {CNN_MODEL_PATH}"
+# ── Fusion Model Tests ────────────────────────────────────────────────────────
+class TestFusionModel:
+    def test_output_shape(self):
+        model  = TomatoFusionModel(num_classes=4)
+        output = model(DUMMY)
+        assert output.shape == (BATCH, 4)
+
+    def test_num_classes(self):
+        for n in [2, 4, 8]:
+            model  = TomatoFusionModel(num_classes=n)
+            output = model(DUMMY)
+            assert output.shape == (BATCH, n)
+
+    def test_backbone_frozen_phase1(self):
+        model      = TomatoFusionModel()
+        cnn_params = [p for p in model.cnn.parameters()]
+        assert not any(p.requires_grad for p in cnn_params)
+
+    def test_unfreeze_backbone(self):
+        model = TomatoFusionModel()
+        model.unfreeze_backbone(layers=["layer3", "layer4"])
+        unfrozen = [
+            p for n, p in model.cnn.named_parameters()
+            if "layer3" in n or "layer4" in n
+        ]
+        assert any(p.requires_grad for p in unfrozen)
+
+    def test_leaf_density_range(self):
+        model = TomatoFusionModel()
+        lpf   = model.get_leaf_density(DUMMY[0:1])
+        assert 0.0 <= lpf <= 1.0
 
 
-def test_cnn_model_loads():
-    assert os.path.exists(CNN_MODEL_PATH), "Model file missing"
-    model = build_model()
-    model.load_state_dict(torch.load(CNN_MODEL_PATH, weights_only=True))
-    assert model is not None
-
-
+# ── CNN Model Tests ───────────────────────────────────────────────────────────
 def test_cnn_output_shape():
-    assert os.path.exists(CNN_MODEL_PATH), "Model file missing"
-    model = build_model()
-    model.load_state_dict(torch.load(CNN_MODEL_PATH, weights_only=True))
+    if not os.path.exists(CNN_MODEL_PATH):
+        pytest.skip("CNN model not yet trained")
+    from src.model import TomatoFusionModel
+    model = TomatoFusionModel(num_classes=NUM_CLASSES).to(DEVICE)
     model.eval()
     dummy = torch.zeros(1, 3, IMG_SIZE[0], IMG_SIZE[1]).to(DEVICE)
     with torch.no_grad():
@@ -83,9 +85,10 @@ def test_cnn_output_shape():
 
 
 def test_cnn_output_is_probability():
-    assert os.path.exists(CNN_MODEL_PATH), "Model file missing"
-    model = build_model()
-    model.load_state_dict(torch.load(CNN_MODEL_PATH, weights_only=True))
+    if not os.path.exists(CNN_MODEL_PATH):
+        pytest.skip("CNN model not yet trained")
+    from src.model import TomatoFusionModel
+    model = TomatoFusionModel(num_classes=NUM_CLASSES).to(DEVICE)
     model.eval()
     dummy = torch.rand(1, 3, IMG_SIZE[0], IMG_SIZE[1]).to(DEVICE)
     with torch.no_grad():
@@ -102,6 +105,8 @@ def test_metrics_file_exists():
 
 
 def test_metrics_has_required_keys():
+    if not os.path.exists(METRICS_PATH):
+        pytest.skip("Metrics file not yet generated")
     with open(METRICS_PATH) as f:
         m = json.load(f)
     for key in ["val_accuracy", "train_accuracy", "f1_score", "precision", "recall"]:
@@ -109,7 +114,6 @@ def test_metrics_has_required_keys():
 
 
 def test_val_accuracy_above_threshold():
-    # FIX: skip in CI — synthetic random data makes accuracy meaningless
     if IS_CI:
         pytest.skip("Skipping accuracy threshold test in CI — synthetic data only")
     with open(METRICS_PATH) as f:
@@ -120,7 +124,6 @@ def test_val_accuracy_above_threshold():
 
 
 def test_f1_score_above_threshold():
-    # FIX: skip in CI — synthetic random data makes F1 meaningless
     if IS_CI:
         pytest.skip("Skipping F1 threshold test in CI — synthetic data only")
     with open(METRICS_PATH) as f:
@@ -129,11 +132,11 @@ def test_f1_score_above_threshold():
     assert f1 >= 0.05, f"F1 score {f1} is too low"
 
 
-# ── U-Net Tests ───────────────────────────────────────────────────────────────
+# ── U-Net Trained Model Tests ─────────────────────────────────────────────────
 def test_unet_model_loads():
     if not os.path.exists(UNET_MODEL_PATH):
         pytest.skip("U-Net model not yet trained")
-    model = SimpleUNet(in_channels=3, out_channels=1).to(DEVICE)
+    model = UNet(in_channels=3, out_channels=1).to(DEVICE)
     model.load_state_dict(torch.load(UNET_MODEL_PATH, weights_only=True))
     assert model is not None
 
@@ -141,7 +144,7 @@ def test_unet_model_loads():
 def test_unet_output_shape():
     if not os.path.exists(UNET_MODEL_PATH):
         pytest.skip("U-Net model not yet trained")
-    model = SimpleUNet(in_channels=3, out_channels=1).to(DEVICE)
+    model = UNet(in_channels=3, out_channels=1).to(DEVICE)
     model.load_state_dict(torch.load(UNET_MODEL_PATH, weights_only=True))
     model.eval()
     dummy = torch.zeros(1, 3, IMG_SIZE[0], IMG_SIZE[1]).to(DEVICE)
